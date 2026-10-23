@@ -1,0 +1,100 @@
+# TelegramNotify — reverse proxy example
+#
+# Copy, replace the three placeholders, then:
+#   sudo cp telegram-notify.conf.example /etc/nginx/sites-available/telegram-notify.conf
+#   sudo ln -sf /etc/nginx/sites-available/telegram-notify.conf /etc/nginx/sites-enabled/
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# Replace:
+#   telegram.example.com   the host in telegramNotify.publicUrl
+#   192.0.2.10             the LAN address of the PC running VS Code
+#   /etc/letsencrypt/live/telegram.example.com/   the certificate for that host
+#
+# Telegram then calls POST https://telegram.example.com/telegram/webhook with the
+# X-Telegram-Bot-Api-Secret-Token header; nginx forwards it untouched to the
+# bridge. Only the webhook is published: /health, /pending and /event/* answer
+# the agent hooks on loopback and must not be reachable from the internet.
+
+upstream telegram_notify {
+    server 192.0.2.10:8787;
+    keepalive 8;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name telegram.example.com;
+
+    # Telegram only calls HTTPS. Refuse a plain-HTTP webhook call instead of
+    # redirecting it: a redirect would turn the POST into a GET at the client.
+    location = /telegram/webhook {
+        default_type text/plain;
+        return 426 "Use HTTPS: https://telegram.example.com/telegram/webhook";
+    }
+
+    location / {
+        return 308 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name telegram.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/telegram.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/telegram.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # Telegram update bodies are a few KB; anything larger is not Telegram.
+    client_max_body_size 64k;
+    client_body_timeout  15s;
+
+    access_log /var/log/nginx/telegram-notify.access.log;
+    error_log  /var/log/nginx/telegram-notify.error.log warn;
+
+    # Optional: accept updates only from Telegram's published ranges. Re-check
+    # https://core.telegram.org/bots/webhooks before enabling.
+    # geo $telegram_client {
+    #     default          0;
+    #     149.154.160.0/20 1;
+    #     91.108.4.0/22    1;
+    # }
+    # if ($telegram_client = 0) {
+    #     return 403;
+    # }
+
+    location = /telegram/webhook {
+        proxy_pass http://telegram_notify;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Pass the webhook secret through untouched. The bridge compares it in
+        # constant time and answers 401 before reading the body when it differs.
+        proxy_set_header X-Telegram-Bot-Api-Secret-Token $http_x_telegram_bot_api_secret_token;
+
+        # The update is acknowledged as soon as it is handled; a blocked agent
+        # waits on the loopback call made by its hook, not on this request.
+        proxy_connect_timeout 5s;
+        proxy_send_timeout    15s;
+        proxy_read_timeout    30s;
+
+        # A Telegram retry must reach the bridge, never a cached response.
+        proxy_buffering         off;
+        proxy_request_buffering off;
+        add_header Cache-Control "no-store" always;
+    }
+
+    # Nothing else on this host name is public.
+    location / {
+        default_type text/plain;
+        return 404 "Not found";
+    }
+}

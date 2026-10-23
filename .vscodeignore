@@ -1,0 +1,11 @@
+# Files kept out of the packaged VSIX. Everything else ships.
+# The real config lives in the user data folder; these are belt and braces.
+config.json
+*.local.json
+.git/**
+.github/**
+.vscode/**
+test/**
+.gitignore
+.vscodeignore
+*.vsix

@@ -1,0 +1,221 @@
+{
+  "name": "telegram-notify",
+  "displayName": "TelegramNotify",
+  "description": "Telegram notifications and reply bridge for Copilot, Claude Code and OpenCode agent events.",
+  "publisher": "local",
+  "version": "1.1.0",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other",
+    "Chat"
+  ],
+  "keywords": [
+    "telegram",
+    "notification",
+    "copilot",
+    "claude",
+    "opencode",
+    "agent",
+    "webhook"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "bin": {
+    "telegram-notify": "./src/cli.mjs"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "telegramNotify.toggle",
+        "title": "Toggle Notifications (Status Bar Click)",
+        "category": "TelegramNotify"
+      },
+      {
+        "command": "telegramNotify.start",
+        "title": "Start Bridge",
+        "category": "TelegramNotify"
+      },
+      {
+        "command": "telegramNotify.stop",
+        "title": "Stop Bridge",
+        "category": "TelegramNotify"
+      },
+      {
+        "command": "telegramNotify.restart",
+        "title": "Restart Bridge",
+        "category": "TelegramNotify"
+      },
+      {
+        "command": "telegramNotify.showStatus",
+        "title": "Show Status",
+        "category": "TelegramNotify"
+      },
+      {
+        "command": "telegramNotify.sendTest",
+        "title": "Send Test Notification",
+        "category": "TelegramNotify"
+      },
+      {
+        "command": "telegramNotify.installHooks",
+        "title": "Install Agent Hooks",
+        "category": "TelegramNotify"
+      },
+      {
+        "command": "telegramNotify.registerWebhook",
+        "title": "Register Telegram Webhook",
+        "category": "TelegramNotify"
+      },
+      {
+        "command": "telegramNotify.openSettings",
+        "title": "Open Settings",
+        "category": "TelegramNotify"
+      },
+      {
+        "command": "telegramNotify.showLog",
+        "title": "Show Log",
+        "category": "TelegramNotify"
+      }
+    ],
+    "configuration": {
+      "title": "TelegramNotify",
+      "properties": {
+        "telegramNotify.notificationsEnabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "**Enable notification.** Master switch: sends Telegram messages, accepts answers and starts the bridge with VS Code. The TG icon in the status bar toggles this.",
+          "order": 1
+        },
+        "telegramNotify.botToken": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Telegram bot token from [@BotFather](https://t.me/BotFather), in the form `123456789:AA…`.\n\nStored in plain text in your VS Code settings, which the agent hooks read directly. Keep this file private and out of version control.",
+          "order": 2
+        },
+        "telegramNotify.chatId": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Chat that receives notifications. A numeric user id, a group id starting with `-`, or several separated by commas. Only these chats may answer a request.",
+          "order": 3
+        },
+        "telegramNotify.agents.copilot": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Send GitHub Copilot events to Telegram.",
+          "order": 4
+        },
+        "telegramNotify.agents.claude": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Send Claude Code events to Telegram, and return permission and question answers to it.",
+          "order": 5
+        },
+        "telegramNotify.agents.opencode": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Send OpenCode events to Telegram, and return permission answers to it.",
+          "order": 6
+        },
+        "telegramNotify.notifyOnCompleted": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Send a notification when a task or session finishes.",
+          "order": 7
+        },
+        "telegramNotify.notifyOnStart": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Copilot only: announce that a prompt was submitted.",
+          "order": 8
+        },
+        "telegramNotify.replyTimeoutSeconds": {
+          "type": "number",
+          "default": 900,
+          "minimum": 30,
+          "markdownDescription": "How long a blocked agent waits for a Telegram answer before it falls back to its terminal prompt.",
+          "order": 9
+        },
+        "telegramNotify.maxMessageLength": {
+          "type": "number",
+          "default": 3800,
+          "minimum": 200,
+          "maximum": 4096,
+          "markdownDescription": "Upper bound for one Telegram message, below the 4096 character API limit.",
+          "order": 10
+        },
+        "telegramNotify.webhookEnabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "**Enable Webhook.** On: the bridge listens for Telegram calls on `webhookPort` and registers `publicUrl` with Telegram. Off: the webhook is removed and answers are collected by **long polling** instead, so no public URL or nginx is needed.\n\nThe bridge stays local either way, because the agent hooks call it on loopback.",
+          "order": 11
+        },
+        "telegramNotify.webhookPort": {
+          "type": "number",
+          "default": 8787,
+          "minimum": 1,
+          "maximum": 65535,
+          "markdownDescription": "Port for the webhook and the loopback API the agent hooks call. Used in both delivery modes.",
+          "order": 12
+        },
+        "telegramNotify.webhookHost": {
+          "type": "string",
+          "default": "0.0.0.0",
+          "markdownDescription": "Interface the bridge binds to. `0.0.0.0` lets a reverse proxy reach it; `127.0.0.1` keeps it local-only, which is all polling needs.",
+          "order": 13
+        },
+        "telegramNotify.webhookPath": {
+          "type": "string",
+          "default": "/telegram/webhook",
+          "markdownDescription": "Webhook path. `/telegram/webhook` and `/webhook` are also accepted.",
+          "order": 14
+        },
+        "telegramNotify.webhookSecretToken": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Secret Telegram echoes in the `X-Telegram-Bot-Api-Secret-Token` header of every webhook call. Only `A-Z a-z 0-9 _ -` are allowed.\n\nLeave empty and TelegramNotify generates one on first start. Not used in polling mode.",
+          "order": 15
+        },
+        "telegramNotify.publicUrl": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Public HTTPS base URL of the reverse proxy in front of the bridge, for example `https://www.example.com`. When set, the webhook is registered on every start. Ignored in polling mode.",
+          "order": 16
+        },
+        "telegramNotify.pollingTimeoutSeconds": {
+          "type": "number",
+          "default": 25,
+          "minimum": 1,
+          "maximum": 50,
+          "markdownDescription": "Long-polling wait per Telegram request, used only when **Enable Webhook** is off. 25 keeps the reply latency low without hammering the API.",
+          "order": 17
+        },
+        "telegramNotify.logLevel": {
+          "type": "string",
+          "default": "info",
+          "enum": [
+            "silent",
+            "error",
+            "warn",
+            "info",
+            "debug"
+          ],
+          "markdownDescription": "Verbosity of the TelegramNotify output channel.",
+          "order": 18
+        }
+      }
+    }
+  },
+  "scripts": {
+    "start": "node src/cli.mjs serve",
+    "serve": "node src/cli.mjs serve",
+    "init": "node src/cli.mjs init",
+    "doctor": "node src/cli.mjs doctor",
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "package": "npx --yes @vscode/vsce package --no-dependencies"
+  }
+}

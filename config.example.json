@@ -1,0 +1,21 @@
+{
+  "notificationsEnabled": true,
+  "botToken": "123456789:AAExampleTelegramBotToken",
+  "chatId": "123456789",
+  "agents": {
+    "copilot": true,
+    "claude": true,
+    "opencode": true
+  },
+  "notifyOnCompleted": true,
+  "notifyOnStart": false,
+  "replyTimeoutSeconds": 900,
+  "maxMessageLength": 3800,
+  "webhookEnabled": true,
+  "webhookPort": 8787,
+  "webhookHost": "0.0.0.0",
+  "webhookPath": "/telegram/webhook",
+  "webhookSecretToken": "replace-with-a-long-random-secret",
+  "publicUrl": "",
+  "pollingTimeoutSeconds": 25
+}
