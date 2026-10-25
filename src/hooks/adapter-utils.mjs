@@ -56,7 +56,7 @@ export async function postEvent(agent, payload, options = {}) {
  * @param {any} value
  * @param {number} limit
  */
-export function shorten(value, limit = 400) {
+export function shorten(value, limit = 4000) {
   const text = typeof value === 'string' ? value : JSON.stringify(value);
   if (!text) return '';
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;

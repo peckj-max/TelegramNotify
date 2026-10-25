@@ -17,5 +17,8 @@
   "webhookPath": "/telegram/webhook",
   "webhookSecretToken": "replace-with-a-long-random-secret",
   "publicUrl": "",
-  "pollingTimeoutSeconds": 25
+  "pollingTimeoutSeconds": 25,
+  "remotePromptEnabled": false,
+  "claudeOpenSession": true,
+  "panelWaitSeconds": 20
 }

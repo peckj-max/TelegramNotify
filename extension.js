@@ -14,6 +14,8 @@
  */
 
 const vscode = require('vscode');
+const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { randomBytes } = require('node:crypto');
 const { pathToFileURL } = require('node:url');
@@ -36,17 +38,77 @@ const BRIDGE_SETTING_KEYS = [
   'webhookHost',
   'webhookPath',
   'replyTimeoutSeconds',
+  'pollingTimeoutSeconds',
   'notifyOnCompleted',
   'notifyOnStart',
   'maxMessageLength',
-  'pollingTimeoutSeconds',
   'agents.copilot',
   'agents.claude',
   'agents.opencode',
+  'remotePromptEnabled',
+  'claudeOpenSession',
+  'claudeAskWindowSeconds',
+  'panelWaitSeconds',
 ];
 
 /** A double click delivers two command invocations; collapse them into one. */
 const TOGGLE_GUARD_MS = 400;
+
+/** The Telegram prompt goes to the agent that reported an event last. */
+const LAST_AGENT_KEY = 'telegramNotify.lastAgent';
+
+/**
+ * Hooks are how a turn that the user started (rather than one Telegram started)
+ * reaches the bridge. Without them Claude and OpenCode report nothing, so they
+ * are made sure of on every start, for the agents that are enabled and present.
+ *
+ * Copilot's approvals and questions are not hooked: a `permissionRequest` hook runs
+ * before Copilot decides whether to ask, so an auto-approved call would look like a
+ * prompt. Its event log is watched instead — see startCopilotWatcher.
+ */
+async function ensureHooks(runtime) {
+  let install;
+  let isAgentInstalled;
+  try {
+    ({ install, isAgentInstalled } = await import(pathToFileURL(path.join(ROOT, 'src', 'install.mjs')).href));
+  } catch (err) {
+    log(`could not load the hook installer: ${err.message}`);
+    return;
+  }
+
+  for (const [agent, enabled] of Object.entries(runtime.agents ?? {})) {
+    if (!enabled) continue;
+    if (agent === 'opencode') {
+      // OpenCode 2.x rejects a plugin file (it wants a directory) and its plugin
+      // API cannot report turns, so its sessions are watched over the HTTP API
+      // instead — see startOpenCodeWatcher.
+      continue;
+    }
+    if (!isAgentInstalled(agent)) {
+      log(`${agent} is not installed on this machine; its hooks were skipped`);
+      continue;
+    }
+    try {
+      const result = install(undefined, { agent, global: true });
+      log(`${agent} hooks ready (${result.files.length} file(s))`);
+    } catch (err) {
+      log(`could not install ${agent} hooks: ${err.message}`);
+    }
+  }
+}
+
+/**
+ * Settings that were removed. A Telegram prompt now always runs in VS Code Chat
+ * for the agent in use, and the bridge starts with the extension, so these would
+ * only linger as "Unknown Configuration Setting" warnings in settings.json.
+ */
+const OBSOLETE_SETTING_KEYS = [
+  'autoStart',
+  'remotePromptAgent',
+  'remotePromptMode',
+  'remotePromptCwd',
+  'remotePromptTimeoutSeconds',
+];
 
 /** @type {vscode.OutputChannel} */
 let output;
@@ -54,6 +116,10 @@ let output;
 let statusItem;
 /** @type {{ server: import('node:http').Server, notifier: any }|null} */
 let bridge = null;
+/** @type {any} watches OpenCode sessions so their turns reach Telegram */
+let bridgeWatcher = null;
+/** @type {any} watches Copilot's event log for prompts waiting in the panel */
+let copilotWatcher = null;
 /** @type {any} */
 let modules = null;
 let starting = null;
@@ -85,6 +151,117 @@ function log(message) {
 function readSettings() {
   const configuration = vscode.workspace.getConfiguration(SECTION);
   return modules.settings.readSettingsSection((key) => configuration.get(key));
+}
+
+/**
+ * Builds the submitter the bridge uses for Telegram prompts. Running through the
+ * editor means the session is listed in Chat and the user can manage it.
+ */
+function makeEditorSubmitter() {
+  return async ({ agent, prompt }) => {
+    const { submitToEditor } = await import(pathToFileURL(path.join(ROOT, 'src', 'editor-prompt.mjs')).href);
+    return submitToEditor({
+      agent,
+      prompt,
+      executeCommand: (command, ...args) => vscode.commands.executeCommand(command, ...args),
+    });
+  };
+}
+
+/**
+ * Builds the opener that brings an agent's session to the front. Only Claude Code
+ * has one: its panel cannot be given a prompt, but it can be shown the session a
+ * Telegram turn joined, which is where that turn is written.
+ */
+function makeSessionOpener() {
+  return async ({ agent, sessionId }) => {
+    if (agent !== 'claude' || !sessionId) return { ok: false, outcome: 'unsupported', agent };
+    if (!vscode.extensions.getExtension('anthropic.claude-code')) {
+      return { ok: false, outcome: 'unsupported', agent, error: 'Claude Code is not installed' };
+    }
+    const { openAgentSession } = await import(pathToFileURL(path.join(ROOT, 'src', 'editor-prompt.mjs')).href);
+    return openAgentSession({
+      agent,
+      sessionId,
+      executeCommand: (command, ...args) => vscode.commands.executeCommand(command, ...args),
+      openExternal: (url) => vscode.env.openExternal(vscode.Uri.parse(url)),
+    });
+  };
+}
+
+/**
+ * Builds the reader that fetches the answer of the Chat session we submitted to.
+ * VS Code persists every chat as an operation log; reading it back is how the
+ * answer reaches Telegram without running the model a second time.
+ *
+ * Only Copilot arrives here: a Claude turn is posted complete by its `Stop` hook
+ * when the turn ends, and the sidebar agents keep their sessions where the bridge
+ * cannot read them.
+ */
+function makeChatReplyReader() {
+  let cached = null;
+  return async ({ agent, prompt, sinceMs, timeoutMs, shouldStop }) => {
+    if (agent !== 'copilot') {
+      // Nothing to wait for: an answer posted by the agent's hooks, or one that
+      // only exists in the agent's own UI.
+      return { ok: true, text: '', unsupported: true };
+    }
+
+    cached ??= import(pathToFileURL(path.join(ROOT, 'src', 'chat-log.mjs')).href);
+    const { waitForReply } = await cached;
+    return waitForReply({
+      prompt,
+      sinceMs,
+      timeoutMs,
+      shouldStop,
+      // The session is written under the folder of the open workspace.
+      dirs: chatSessionDirsForWorkspace(),
+    });
+  };
+}
+
+/**
+ * Chat sessions live per workspace. The open folder's storage is checked first,
+ * and the reader falls back to scanning all of them (which also covers the
+ * empty-window sessions).
+ *
+ * @returns {string[]|undefined} undefined means "scan everything"
+ */
+function chatSessionDirsForWorkspace() {
+  const base = path.join(process.env.APPDATA || '', 'Code', 'User');
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  if (!base || !folder) return undefined;
+
+  const key = workspaceStorageId(folder.uri.fsPath);
+  if (!key) return undefined;
+  return [path.join(base, 'workspaceStorage', key, 'chatSessions')];
+}
+
+/**
+ * @param {string} fsPath
+ */
+function workspaceStorageId(fsPath) {
+  // VS Code names workspace folders by a hash of the URI; the folder's own
+  // workspace.json names it, so look for a storage folder whose workspace.json
+  // points at this path.
+  const base = path.join(process.env.APPDATA || '', 'Code', 'User', 'workspaceStorage');
+  try {
+    for (const entry of fs.readdirSync(base)) {
+      const file = path.join(base, entry, 'workspace.json');
+      try {
+        const meta = JSON.parse(fs.readFileSync(file, 'utf8'));
+        const target = meta.folder || meta.workspace;
+        if (typeof target === 'string' && decodeURIComponent(target.replace('file:///', '')).toLowerCase() === fsPath.replace(/\\/g, '/').toLowerCase()) {
+          return entry;
+        }
+      } catch {
+        /* next folder */
+      }
+    }
+  } catch {
+    /* no workspace storage */
+  }
+  return null;
 }
 
 /**
@@ -145,8 +322,40 @@ async function startBridge({ silent = false } = {}) {
       return null;
     }
 
-    const instance = new notifier.Notifier(runtime);
+    const instance = new notifier.Notifier(runtime, {
+      submitPrompt: makeEditorSubmitter(),
+      readChatReply: makeChatReplyReader(),
+      openAgentSession: makeSessionOpener(),
+      // A headless Claude run belongs in the folder the user is working in.
+      defaultCwd: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+      // A Telegram prompt goes to the agent that was used last, so switching to
+      // Claude or OpenCode in the editor is enough — there is no setting for it.
+      initialAgent: context?.globalState?.get(LAST_AGENT_KEY),
+      rememberAgent: async (agent) => {
+        try {
+          await context?.globalState?.update(LAST_AGENT_KEY, agent);
+        } catch (err) {
+          log(`could not remember the last agent: ${err.message}`);
+        }
+      },
+    });
+
+    // Turns the user starts must reach the bridge too; that is the hooks' job.
+    await ensureHooks(runtime);
+    removeObsoleteOpenCodePlugin();
+
     const started = await server.startServer(runtime, { notifier: instance });
+
+    // OpenCode 2.x cannot load a plugin that reports turns, so its own HTTP API is
+    // watched instead. It is the server the desktop app and the sidebar share.
+    bridgeWatcher = await startOpenCodeWatcher(instance);
+    // The watcher must know which turns the bridge itself answered, so a prompt
+    // sent from Telegram is not also reported as a finished OpenCode turn.
+    instance.openCodeWatcher = bridgeWatcher;
+
+    // Copilot's permission and question prompts are only visible in its own event
+    // log; no hook sees them without also seeing the auto-approved calls.
+    copilotWatcher = await startCopilotWatcher(instance, runtime);
 
     bridge = started;
     setStatus(true, runtime);
@@ -233,10 +442,170 @@ async function warnIfWebhookUnreachable(url) {
   }
 }
 
+/**
+ * Removes the OpenCode plugin entry older versions of this extension wrote.
+ *
+ * OpenCode 2.x rejects that plugin (it wants a directory, and its event stream is
+ * not iterable from plain JavaScript), so leaving it behind only produces a
+ * "failed to load plugin" warning on every start. Turns are watched over the HTTP
+ * API instead.
+ */
+function removeObsoleteOpenCodePlugin() {
+  const configDir = path.join(os.homedir(), '.config', 'opencode');
+  const configFile = path.join(configDir, 'opencode.json');
+  try {
+    const text = fs.readFileSync(configFile, 'utf8');
+    const parsed = JSON.parse(text);
+    const plugins = Array.isArray(parsed.plugin) ? parsed.plugin : [];
+    const kept = plugins.filter((entry) => !String(entry).includes('telegram-notify'));
+    if (kept.length === plugins.length) {
+      // Nothing of ours is listed; the stub is what needs removing.
+    } else {
+      if (kept.length) parsed.plugin = kept;
+      else delete parsed.plugin;
+      fs.writeFileSync(configFile, `${JSON.stringify(parsed, null, 2)}\r\n`, 'utf8');
+      log('removed the obsolete opencode plugin entry');
+    }
+  } catch {
+    /* no config, or not JSON we should touch */
+  }
+
+  for (const stub of [path.join(configDir, 'plugin', 'telegram-notify.mjs'), path.join(configDir, 'plugin', 'telegram-notify')]) {
+    try {
+      fs.rmSync(stub, { recursive: true, force: true });
+      log(`removed the obsolete opencode plugin ${stub}`);
+    } catch {
+      /* not there */
+    }
+  }
+}
+
+/**
+ * Watches the local OpenCode server for finished turns and tells Telegram.
+ *
+ * Why the API instead of a plugin: OpenCode 2.x only loads a plugin from a
+ * *directory*, its `event.subscribe()` hands back an Effect stream that plain
+ * JavaScript cannot iterate, and `session.hook()` handlers never fired. The
+ * server's own session list is where every turn ends up, so polling it is both
+ * reliable and independent of the plugin API.
+ *
+ * The watcher is started even when the server is not up yet: OpenCode usually
+ * starts after VS Code, so it connects as soon as the server answers and
+ * reconnects if it restarts.
+ *
+ * @param {any} notifier
+ * @returns {Promise<any|null>}
+ */
+async function startOpenCodeWatcher(notifier) {
+  if (!notifier?.config?.agents?.opencode) {
+    log('opencode events are off; its session watcher was not started');
+    return null;
+  }
+  try {
+    const opencode = await import(pathToFileURL(path.join(ROOT, 'src', 'opencode-log.mjs')).href);
+    const endpoint = opencode.discoverEndpoint();
+    log(
+      endpoint
+        ? `waiting for the opencode server at ${endpoint.baseUrl} to answer`
+        : 'waiting for the opencode server; its session watcher is running',
+    );
+    return new opencode.OpenCodeWatcher({
+      endpoint: () => opencode.discoverEndpoint(),
+      // Every open folder: a multi-root workspace keeps its sessions under any of
+      // them, and a single-folder window under its one folder.
+      directory: () => (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
+      onConnect: (baseUrl) => log(`watching opencode sessions at ${baseUrl}`),
+      // The watcher's own lines belong in the extension's output channel, where the
+      // user can see what was detected and sent. Poll failures are only noise
+      // unless the log level asks for them.
+      log: (level, message) => {
+        const configured = String(vscode.workspace.getConfiguration(SECTION).get('logLevel') || 'info').toLowerCase();
+        if (level === 'debug' && configured !== 'debug') return;
+        log(`opencode: ${message}`);
+      },
+      onCompleted: async (turn) => {
+        if (!notifier.notificationsEnabled || notifier.config.notifyOnCompleted === false) {
+          log(`opencode turn in ${turn.sessionId} finished but completion notifications are off`);
+          return;
+        }
+        const title = turn.title ? `OpenCode finished — ${turn.title}` : 'OpenCode finished';
+        const message =
+          turn.outcome === 'failed'
+            ? turn.error || turn.text || 'The turn failed.'
+            : turn.text || 'The session is idle (no text was produced).';
+        log(`opencode turn in ${turn.sessionId} finished (${turn.outcome}); notifying`);
+        const result = await notifier.notify({
+          type: turn.outcome === 'failed' ? 'error' : 'completed',
+          agent: 'opencode',
+          title,
+          message,
+          cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+        });
+        if (result?.ok === false && !result.skipped) {
+          log(`opencode completion could not be sent: ${result.reason || 'unknown reason'}`);
+        }
+      },
+    }).start();
+  } catch (err) {
+    log(`could not watch opencode sessions: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Watches Copilot's session event log for prompts the panel is showing.
+ *
+ * `permission.requested` is written only when Copilot's permission service asks,
+ * and a pending `ask_user` call is written only while its form waits — both happen
+ * after the automatic decisions, so an auto-approved call is never reported.
+ *
+ * @param {any} notifier
+ * @param {import('./src/config.mjs').RuntimeConfig} runtime
+ */
+async function startCopilotWatcher(notifier, runtime) {
+  if (!runtime.agents?.copilot) {
+    log('copilot events are off; its prompt watcher was not started');
+    return null;
+  }
+  if (!(Number(runtime.panelWaitSeconds) > 0)) {
+    log('panel reporting is off (panelWaitSeconds is 0); copilot prompts are not watched');
+    return null;
+  }
+  try {
+    const events = await import(pathToFileURL(path.join(ROOT, 'src', 'copilot-events.mjs')).href);
+    return new events.CopilotEventWatcher({
+      waitSeconds: runtime.panelWaitSeconds,
+      // The workspace is what the user is looking at; sessions in other folders
+      // belong to another window. An empty list (no folder open) watches all.
+      directory: () => (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
+      enabled: () => notifier.notificationsEnabled !== false,
+      log: (level, message) => {
+        const configured = String(vscode.workspace.getConfiguration(SECTION).get('logLevel') || 'info').toLowerCase();
+        if (level === 'debug' && configured !== 'debug') return;
+        log(`copilot: ${message}`);
+      },
+      onPending: async (entry) => {
+        const payload = events.notificationFor(entry);
+        const result = await notifier.notify(payload);
+        if (result?.ok === false && !result.skipped) {
+          log(`copilot ${entry.kind} notification could not be sent: ${result.reason || result.error || 'unknown reason'}`);
+        }
+      },
+    }).start();
+  } catch (err) {
+    log(`could not watch copilot sessions: ${err.message}`);
+    return null;
+  }
+}
+
 async function stopBridge({ silent = false } = {}) {
   if (!bridge || stopping) return;
   stopping = true;
   try {
+    bridgeWatcher?.stop();
+    bridgeWatcher = null;
+    copilotWatcher?.stop();
+    copilotWatcher = null;
     await modules.server.closeServer(bridge.server, bridge.notifier, bridge.polling);
     log('bridge stopped');
     if (!silent) vscode.window.showInformationMessage('TelegramNotify stopped.');
@@ -286,6 +655,20 @@ async function updateSetting(key, value) {
   return true;
 }
 
+/** Drops the settings this version no longer contributes. */
+async function removeObsoleteSettings() {
+  const configuration = vscode.workspace.getConfiguration(SECTION);
+  for (const key of OBSOLETE_SETTING_KEYS) {
+    if (configuration.inspect(key)?.globalValue === undefined) continue;
+    try {
+      await configuration.update(key, undefined, vscode.ConfigurationTarget.Global);
+      log(`removed obsolete setting ${key}`);
+    } catch (err) {
+      log(`could not remove ${key}: ${err.message}`);
+    }
+  }
+}
+
 /**
  * Status bar click: turn notifications on or off, and save the switch.
  *
@@ -333,8 +716,10 @@ async function showStatus() {
     `${bridge ? `Bridge: running on ${config?.webhookPort} (${config?.webhookEnabled === false ? 'polling' : 'webhook'})` : 'Bridge: stopped'}`,
     `Notifications: ${vscode.workspace.getConfiguration(SECTION).get('notificationsEnabled') !== false ? 'on' : 'off'}`,
     `Webhook: ${vscode.workspace.getConfiguration(SECTION).get('webhookEnabled') !== false ? 'on' : 'off (polling)'}`,
+    `Remote prompts: ${config?.remotePromptEnabled ? `on (VS Code Chat, last agent: ${bridge?.notifier?.lastAgent ?? 'copilot'})` : 'off'}`,
     `Agents: ${Object.entries(config?.agents ?? {}).map(([name, on]) => `${name}=${on ? 'on' : 'off'}`).join(' ')}`,
     `Pending: ${pending.length}`,
+    `Running prompts: ${bridge ? bridge.notifier.activePrompts?.size ?? 0 : 0}`,
     `Config: ${settingsFileLabel()}`,
   ].filter(Boolean);
 
@@ -351,6 +736,23 @@ async function showStatus() {
     bridge?.notifier.cancel(id);
     log(`cancelled ${id}`);
   }
+}
+
+/**
+ * Stops every waiting request and running prompt, so no progress heartbeat can
+ * keep arriving after the user asks for quiet.
+ */
+async function cancelAllTasks() {
+  if (!bridge) {
+    vscode.window.showInformationMessage('TelegramNotify: no ongoing tasks (the bridge is stopped).');
+    return 0;
+  }
+  const cancelled = bridge.notifier.cancelAll();
+  vscode.window.showInformationMessage(
+    cancelled ? `TelegramNotify: cancelled ${cancelled} ongoing task(s).` : 'TelegramNotify: no ongoing tasks.',
+  );
+  refreshStatus();
+  return cancelled;
 }
 
 async function installHooks() {
@@ -380,15 +782,6 @@ async function installHooks() {
   );
   if (!agents?.length) return;
 
-  const approvals = await vscode.window.showQuickPick(
-    [
-      { label: 'Notifications only', description: 'No blocking tool prompts', value: false },
-      { label: 'Also answer Copilot tool permissions', description: 'Every tool call waits for Telegram', value: true },
-    ],
-    { title: 'Copilot approvals' },
-  );
-  if (!approvals) return;
-
   try {
     const installer = await import(pathToFileURL(path.join(ROOT, 'src', 'install.mjs')).href);
     const selected = agents.some((item) => item.value === 'all') ? ['copilot', 'claude', 'opencode'] : agents.map((item) => item.value);
@@ -402,7 +795,6 @@ async function installHooks() {
       const result = installer.install(root ?? process.cwd(), {
         agent,
         global: scope.target === 'global',
-        approvals: Boolean(approvals.value),
       });
       files.push(...result.files);
     }
@@ -500,6 +892,7 @@ function activate(ctx) {
     await startBridge();
   });
   register('telegramNotify.showStatus', showStatus);
+  register('telegramNotify.cancelAll', cancelAllTasks);
   register('telegramNotify.openSettings', () => openSettings());
   register('telegramNotify.sendTest', sendTest);
   register('telegramNotify.installHooks', installHooks);
@@ -549,6 +942,7 @@ function activate(ctx) {
     })
     .then(async () => {
       if (!modules) return;
+      await removeObsoleteSettings();
       await buildConfig().catch((err) => log(`config read failed: ${err.message}`));
       const configuration = vscode.workspace.getConfiguration(SECTION);
       if (configuration.get('notificationsEnabled') === false) {

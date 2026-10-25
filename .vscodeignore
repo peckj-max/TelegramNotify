@@ -2,6 +2,7 @@
 # The real config lives in the user data folder; these are belt and braces.
 config.json
 *.local.json
+AGENTS.md
 .git/**
 .github/**
 .vscode/**

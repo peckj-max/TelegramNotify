@@ -6,8 +6,12 @@
  * `configFromSettings`, so the editor and the bridge cannot drift apart.
  */
 
-/** Every setting the section contributes, in the order the Settings UI shows it. */
-const ALL_SETTINGS = [
+/**
+ * Every setting the section contributes, in the order the Settings UI shows it.
+ * Single source of truth: the extension reads the section through this list, and
+ * the hooks read `settings.json` through it too.
+ */
+export const ALL_SETTINGS = [
   'notificationsEnabled',
   'botToken',
   'chatId',
@@ -25,6 +29,10 @@ const ALL_SETTINGS = [
   'webhookSecretToken',
   'publicUrl',
   'pollingTimeoutSeconds',
+  'remotePromptEnabled',
+  'claudeOpenSession',
+  'claudeAskWindowSeconds',
+  'panelWaitSeconds',
 ];
 
 /**
@@ -52,6 +60,10 @@ export function configFromSettings(settings = {}) {
     webhookSecretToken: settings.webhookSecretToken,
     publicUrl: settings.publicUrl,
     pollingTimeoutSeconds: settings.pollingTimeoutSeconds,
+    remotePromptEnabled: settings.remotePromptEnabled,
+    claudeOpenSession: settings.claudeOpenSession,
+    claudeAskWindowSeconds: settings.claudeAskWindowSeconds,
+    panelWaitSeconds: settings.panelWaitSeconds,
   };
   for (const key of Object.keys(raw)) {
     if (raw[key] === undefined || raw[key] === null) delete raw[key];

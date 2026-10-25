@@ -1,3 +1,7 @@
+import { escapeHtml, markdownToTelegramHtml, splitHtml } from './markdown.mjs';
+
+export { escapeHtml };
+
 const TYPE_LABELS = {
   question: 'Question',
   permission: 'Permission',
@@ -6,42 +10,21 @@ const TYPE_LABELS = {
   error: 'Error',
 };
 
-const MAX_DETAIL = 1200;
-
-function escapeHtml(value) {
-  return String(value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
 export function truncate(value, limit) {
   const text = String(value ?? '');
   if (text.length <= limit) return text;
   return `${text.slice(0, Math.max(0, limit - 1))}…`;
 }
 
-function detailBlock(value) {
-  if (!value) return '';
-  const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-  if (!text) return '';
-  return `<pre>${escapeHtml(truncate(text, MAX_DETAIL))}</pre>`;
-}
-
 /**
+ * The message header: title, the agent facts, and the answering hint.
+ *
  * @param {object} request
- * @param {'question'|'permission'|'completed'|'info'|'error'} request.type
- * @param {string} [request.agent]
- * @param {string} [request.title]
- * @param {string} [request.message]
- * @param {string} [request.detail]
- * @param {string} [request.cwd]
- * @param {string[]} [request.options]
- * @param {boolean} [request.waitForReply]
- * @param {number} [request.timeoutSeconds]
+ * @returns {string}
  */
 export function formatNotification(request) {
   const type = TYPE_LABELS[request.type] ? request.type : 'info';
-  const heading = request.title?.trim() || TYPE_LABELS[type];
+  const heading = String(request.title ?? '').trim() || TYPE_LABELS[type];
   const lines = [`<b>${escapeHtml(heading)}</b>`];
 
   const facts = [];
@@ -49,9 +32,10 @@ export function formatNotification(request) {
   if (request.cwd) facts.push(`cwd: ${escapeHtml(truncate(request.cwd, 120))}`);
   if (facts.length) lines.push(`<i>${facts.join(' · ')}</i>`);
 
-  if (request.message) lines.push(escapeHtml(truncate(request.message, 3000)));
-
-  if (type === 'completed' && !request.message) lines.push('The task finished.');
+  if (type === 'completed' && !request.message && !request.detail) {
+    // A bare "finished" line tells the reader nothing; say what is known instead.
+    lines.push(request.cwd ? 'Finished — no summary was available from the agent.' : 'Finished.');
+  }
 
   if (request.waitForReply) {
     const hint = request.options?.length ? 'Reply with /1 /2 … or tap a button.' : 'Reply to this message to answer.';
@@ -63,15 +47,35 @@ export function formatNotification(request) {
 }
 
 /**
+ * Renders one notification into one or more Telegram messages.
+ *
+ * Agent output is Markdown, so it is converted to Telegram's HTML subset; when
+ * the result is longer than `maxLength` it is split instead of truncated, so no
+ * answer or detail is lost.
+ *
  * @param {object} request
  * @param {number} maxLength
+ * @returns {string[]} at least one message
  */
-export function formatAgentMessage(request, maxLength) {
+export function formatAgentMessages(request, maxLength) {
   const head = formatNotification(request);
-  const body = request.detail ? detailBlock(request.detail) : '';
-  const full = body ? `${head}\n${body}` : head;
-  if (full.length <= maxLength) return full;
-  return `${truncate(full, Math.max(64, maxLength - 1))}`;
+
+  const message = String(request.message ?? '').trim();
+  const detail = request.detail === undefined || request.detail === null ? '' : request.detail;
+  const detailText = typeof detail === 'string' ? detail : JSON.stringify(detail, null, 2);
+
+  const parts = [head];
+  if (message) parts.push(markdownToTelegramHtml(message));
+  if (detailText.trim()) {
+    const body = markdownToTelegramHtml(detailText);
+    // A detail that is already fenced renders as its own pre block; anything
+    // else is quoted so it is visibly separate from the message.
+    parts.push(body.startsWith('<pre>') ? body : `<blockquote>${body}</blockquote>`);
+  }
+
+  const html = parts.filter(Boolean).join('\n\n');
+  const chunks = splitHtml(html, maxLength);
+  return chunks.length ? chunks : ['<b>TelegramNotify</b>'];
 }
 
 export function formatDuration(seconds) {

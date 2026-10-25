@@ -1,10 +1,32 @@
-import { formatAgentMessage, formatDuration, formatResolution, truncate } from './message.mjs';
+import { formatAgentMessages, formatDuration, formatResolution, truncate } from './message.mjs';
+import { fitsOneMessage } from './markdown.mjs';
 import { PendingRequests } from './pending.mjs';
+import { AGENTS } from './config.mjs';
+import { runClaudePrompt, runOpenCodePrompt } from './remote-prompt.mjs';
+import { askReplyPrompt } from './hooks/ask.mjs';
 import { TelegramClient } from './telegram.mjs';
 import { log } from './logger.mjs';
 
 const TYPES = new Set(['question', 'permission', 'completed', 'info', 'error']);
 const MAX_PENDING = 50;
+/** Telegram clears the typing hint after ~5s; refresh it before that. */
+const TYPING_INTERVAL_MS = 10000;
+/** How many update ids are remembered to drop Telegram's redeliveries. */
+const MAX_SEEN_UPDATES = 500;
+/** Sent when the Stop button ends a prompt that came from Telegram. */
+const USER_CANCELLED_TEXT = 'Task is cancelled by user.';
+/** Agent for a Telegram prompt before any agent has reported an event. */
+const DEFAULT_AGENT = 'copilot';
+/** What OpenCode accepts for a permission, in the order the buttons are drawn. */
+const OPENCODE_PERMISSION_OPTIONS = ['Allow once', 'Always allow', 'Deny'];
+/**
+ * How long a Claude prompt submitted to Chat waits for its `Stop` hook. The hook
+ * is how the turn's answer reaches Telegram, so its completion is the end of the
+ * turn; the cap only stops the typing hint when a window has no working hooks.
+ */
+const CLAUDE_HOOK_WAIT_MS = 30 * 60 * 1000;
+/** The wait polls the prompt's flags; a turn reports at most a few times a minute. */
+const CLAUDE_HOOK_POLL_MS = 500;
 
 function normalizeType(value) {
   const type = String(value || 'info').toLowerCase();
@@ -29,12 +51,52 @@ function normalizeOptions(value) {
 export class Notifier {
   /**
    * @param {import('./config.mjs').RuntimeConfig} config
-   * @param {{ telegram?: TelegramClient, pending?: PendingRequests }} [deps]
+   * @param {{
+   *   telegram?: TelegramClient,
+   *   pending?: PendingRequests,
+   *   submitPrompt?: (input: { agent: string, prompt: string }) => Promise<any>,
+   *   typingIntervalMs?: number,
+   *   initialAgent?: string,
+   *   rememberAgent?: (agent: string) => void|Promise<void>,
+   *   runClaudePrompt?: typeof runClaudePrompt,
+   *   runOpenCodePrompt?: typeof runOpenCodePrompt,
+   *   openCodeWatcher?: { suppressNextTurn?: (sessionId: string) => void, resumeReporting?: (sessionId: string) => void },
+   *   openAgentSession?: (input: { agent: string, sessionId: string }) => any,
+   *   defaultCwd?: string | (() => string|undefined),
+   * }} [deps]
    */
   constructor(config, deps = {}) {
     this.config = config;
     this.telegram = deps.telegram ?? new TelegramClient(config);
     this.pending = deps.pending ?? new PendingRequests();
+    // Injectable so tests never spawn an agent CLI.
+    this.runClaudePrompt = deps.runClaudePrompt ?? runClaudePrompt;
+    this.runOpenCodePrompt = deps.runOpenCodePrompt ?? runOpenCodePrompt;
+    // Working directory for a headless Claude run: the open workspace folder.
+    this.defaultCwd = deps.defaultCwd ?? undefined;
+    this.typingIntervalMs = Math.max(100, Number(deps.typingIntervalMs) || TYPING_INTERVAL_MS);
+    // Set by the extension host: submits to VS Code Chat, the only runner.
+    this.submitPrompt = deps.submitPrompt ?? null;
+    // Set by the extension host: reads the reply out of the Chat session log.
+    this.readChatReply = deps.readChatReply ?? null;
+    // Set by the extension host: opens an agent's session in its own panel.
+    this.openAgentSession = deps.openAgentSession ?? null;
+    // A Telegram prompt goes to the agent that was used last; Copilot until some
+    // agent reports an event.
+    this.rememberAgent = deps.rememberAgent ?? null;
+    this.lastAgent = AGENTS.includes(String(deps.initialAgent || '').toLowerCase())
+      ? String(deps.initialAgent).toLowerCase()
+      : DEFAULT_AGENT;
+    // Prompts still running, so they can be stopped instead of reporting
+    // progress until their timeout.
+    this.activePrompts = new Map();
+    this.promptSeq = 0;
+    // Telegram redelivers an update until it is acknowledged; a redelivered
+    // prompt must not start a second session.
+    this.seenUpdates = new Map();
+    // Set by the extension once the OpenCode watcher runs: a prompt answered here
+    // must not be reported again by the watcher.
+    this.openCodeWatcher = deps.openCodeWatcher ?? null;
   }
 
   get ready() {
@@ -52,6 +114,25 @@ export class Notifier {
   }
 
   /**
+   * Remembers which agent is in use, so the next Telegram prompt is delivered to
+   * it rather than to a configured one. Calls that are not real agents — the
+   * extension's own test message reports `vscode` — are ignored.
+   *
+   * @param {unknown} value
+   */
+  #rememberAgent(value) {
+    const agent = String(value ?? '').trim().toLowerCase();
+    if (!AGENTS.includes(agent) || agent === this.lastAgent) return;
+    this.lastAgent = agent;
+    log.debug(`last agent is now ${agent}`);
+    try {
+      Promise.resolve(this.rememberAgent?.(agent)).catch((err) => log.debug(`could not remember the agent: ${err.message}`));
+    } catch (err) {
+      log.debug(`could not remember the agent: ${err.message}`);
+    }
+  }
+
+  /**
    * @param {object} request
    * @param {'question'|'permission'|'completed'|'info'|'error'} [request.type]
    * @param {string} [request.agent]
@@ -66,6 +147,17 @@ export class Notifier {
    */
   async notify(request = {}) {
     const type = normalizeType(request.type);
+    this.#rememberAgent(request.agent);
+    // The turn is over: stop watching any prompt this completion belongs to, so
+    // its typing hint ends and the answer is not posted twice. Done before the
+    // early returns below: a completion never waits for a reply, and the prompt
+    // must end even when this notification is skipped.
+    if (type === 'completed') this.#finishPromptsAnsweredByHook(String(request.agent || ''));
+    if (request.silent === true) {
+      // A hook using the bridge only to say which agent is in use: nothing to send.
+      log.debug(`silent ${request.agent || 'agent'} event recorded`);
+      return { ok: true, skipped: true, reason: 'silent' };
+    }
     if (!this.notificationsEnabled) {
       log.debug('notification skipped: notifications are disabled');
       return { ok: false, skipped: true, reason: 'notifications-disabled' };
@@ -96,7 +188,7 @@ export class Notifier {
     const entry = canWait
       ? this.pending.create({ agent: String(request.agent || ''), type, chatId, options, timeoutSeconds, title: request.title })
       : null;
-    const text = formatAgentMessage(
+    const messages = formatAgentMessages(
       {
         ...request,
         type,
@@ -108,23 +200,31 @@ export class Notifier {
       this.config.maxMessageLength,
     );
 
+    // The keyboard belongs on the first message so it sits with the question.
+    const sentIds = [];
     let sent;
     try {
-      sent = await this.telegram.sendMessage({
-        chatId,
-        text,
-        replyMarkup: entry && options.length ? optionKeyboard(entry.id, options) : undefined,
-      });
+      for (const [index, text] of messages.entries()) {
+        const result = await this.telegram.sendMessage({
+          chatId,
+          text,
+          replyMarkup: index === 0 && entry && options.length ? optionKeyboard(entry.id, options) : undefined,
+        });
+        sentIds.push(result.message_id);
+        if (index === 0) sent = result;
+      }
     } catch (err) {
       log.error(`sendMessage failed: ${err.message}`);
       entry?.resolve({ source: 'cancelled', answer: null, reply: null, optionIndex: null, timedOut: false });
-      return { ok: false, reason: 'telegram-error', error: err.message };
+      return { ok: false, reason: 'telegram-error', error: err.message, messageIds: sentIds };
     }
 
-    if (!entry) return { ok: true, messageId: sent.message_id, chatId };
+    const messageIds = sentIds;
+
+    if (!entry) return { ok: true, messageId: sent.message_id, messageIds, chatId };
 
     this.pending.attachMessage(entry.id, sent.message_id);
-    log.debug(`waiting for ${entry.id} (${type}, ${timeoutSeconds}s)`);
+    log.debug(`waiting for ${entry.id} (${type}, ${timeoutSeconds}s, ${messages.length} message(s))`);
 
     const resolution = await entry.wait;
     const footer =
@@ -134,17 +234,13 @@ export class Notifier {
           ? '✖ cancelled'
           : formatResolution(resolution);
 
-    await this.telegram.tryEditMessageText({
-      chatId,
-      messageId: sent.message_id,
-      text: `${text}\n\n${footer}`,
-      replyMarkup: resolution.source === 'timeout' ? undefined : { inline_keyboard: [] },
-    });
+    await this.#markResolved({ chatId, messages, messageIds, footer });
 
     return {
       ok: true,
       requestId: entry.id,
       messageId: sent.message_id,
+      messageIds,
       chatId,
       source: resolution.source,
       answer: resolution.answer ?? null,
@@ -154,12 +250,105 @@ export class Notifier {
     };
   }
 
+  /**
+   * Shows the outcome on the notification itself: the footer is appended where
+   * it fits, and the keyboard is cleared either way.
+   *
+   * @param {{ chatId: string, messages: string[], messageIds: number[], footer: string }} input
+   */
+  async #markResolved({ chatId, messages, messageIds, footer }) {
+    const limit = this.config.maxMessageLength;
+    const clearKeyboard = { inline_keyboard: [] };
+    const first = { chatId, messageId: messageIds[0], text: messages[0], replyMarkup: clearKeyboard };
+
+    if (fitsOneMessage(messages[0], footer, limit)) {
+      await this.telegram.tryEditMessageText({ ...first, text: `${messages[0]}\n\n${footer}` });
+      return;
+    }
+
+    // A full first message: unfreeze it, then put the footer where it fits.
+    await this.telegram.tryEditMessageText(first);
+    const lastIndex = messageIds.length - 1;
+    if (lastIndex > 0 && fitsOneMessage(messages[lastIndex], footer, limit)) {
+      await this.telegram.tryEditMessageText({
+        chatId,
+        messageId: messageIds[lastIndex],
+        text: `${messages[lastIndex]}\n\n${footer}`,
+      });
+      return;
+    }
+    try {
+      await this.telegram.sendMessage({ chatId, text: footer });
+    } catch (err) {
+      log.debug(`could not send the footer: ${err.message}`);
+    }
+  }
+
   /** @param {string} requestId */
   cancel(requestId) {
+    if (!requestId || requestId === 'all' || requestId === '*') return this.cancelAll() > 0;
     const entry = this.pending.get(requestId);
-    if (!entry) return false;
-    entry.resolve({ source: 'cancelled', answer: null, reply: null, optionIndex: null, timedOut: false });
+    if (entry) {
+      entry.resolve({ source: 'cancelled', answer: null, reply: null, optionIndex: null, timedOut: false });
+      return true;
+    }
+    const active = this.activePrompts.get(requestId);
+    if (!active) return false;
+    return this.#cancelPrompt(active);
+  }
+
+  /**
+   * Stops every waiting request and every running prompt. Returns how many
+   * tasks were cancelled.
+   *
+   * @param {'cancelled'|'shutdown'} [reason]
+   */
+  cancelAll(reason = 'cancelled') {
+    const pendingCount = this.pending.size;
+    this.pending.cancelAll(reason);
+    let activeCount = 0;
+    for (const active of this.activePrompts.values()) {
+      if (this.#cancelPrompt(active)) activeCount += 1;
+    }
+    return pendingCount + activeCount;
+  }
+
+  /**
+   * @param {{ id: string, agent: string, prompt: string, chatId: string|number }} input
+   */
+  #trackPrompt({ id, agent, prompt, chatId }) {
+    const active = {
+      id,
+      agent,
+      prompt,
+      chatId,
+      startedAt: Date.now(),
+      cancelled: false,
+      // Set when the agent hooks report the turn ended, so the bridge stops
+      // watching a prompt whose answer already reached Telegram.
+      hookAnswered: false,
+      stopTyping: () => {},
+      controller: new AbortController(),
+    };
+    this.activePrompts.set(id, active);
+    return active;
+  }
+
+  /** @param {{ cancelled: boolean, controller: AbortController, stopTyping: () => void }} active */
+  #cancelPrompt(active) {
+    if (active.cancelled) return false;
+    active.cancelled = true;
+    active.stopTyping?.();
+    try {
+      active.controller.abort();
+    } catch {
+      /* already aborted */
+    }
     return true;
+  }
+
+  #cancelledPrompt(id, agent) {
+    return { handled: true, command: 'prompt', ok: false, cancelled: true, agent, promptId: id };
   }
 
   /**
@@ -169,6 +358,10 @@ export class Notifier {
    * @param {any} update
    */
   async handleUpdate(update) {
+    if (this.#isRedelivery(update)) {
+      log.debug(`ignored redelivered update ${update?.update_id}`);
+      return { handled: false, reason: 'duplicate-update', updateId: update?.update_id };
+    }
     try {
       if (update?.callback_query) return await this.handleCallbackQuery(update.callback_query);
       if (update?.message) return await this.handleMessage(update.message);
@@ -176,6 +369,82 @@ export class Notifier {
     } catch (err) {
       log.error(`update handling failed: ${err.message}`);
       return { handled: false, error: err.message };
+    }
+  }
+
+  /**
+   * A slow handler (a prompt runs for minutes) makes Telegram resend the same
+   * update. Both the update id and the message identity are remembered so a
+   * retry is dropped even when Telegram assigns it a new update id.
+   *
+   * @param {any} update
+   */
+  #isRedelivery(update) {
+    const message = update?.message;
+    const keys = [];
+    if (typeof update?.update_id === 'number') keys.push(`u:${update.update_id}`);
+    if (message?.message_id !== undefined) keys.push(`m:${message.chat?.id}:${message.message_id}`);
+    if (!keys.length) return false;
+
+    const seen = keys.some((key) => this.seenUpdates.has(key));
+    for (const key of keys) this.seenUpdates.set(key, Date.now());
+    while (this.seenUpdates.size > MAX_SEEN_UPDATES) {
+      const oldest = this.seenUpdates.keys().next().value;
+      this.seenUpdates.delete(oldest);
+    }
+    return seen;
+  }
+
+  /**
+   * Keeps the "typing…" hint alive while a prompt runs. Telegram drops the hint
+   * after a few seconds, so it is refreshed on a timer instead of posting
+   * "still working" messages that pile up in the chat.
+   *
+   * The refresh has no deadline of its own: the prompt that owns it stops it when
+   * the task really finishes, fails or is cancelled.
+   *
+   * @param {string|number} chatId
+   * @returns {() => void} stops the refresh
+   */
+  #startTyping(chatId) {
+    if (!this.notificationsEnabled || !this.telegram.enabled) return () => {};
+    const target = String(chatId ?? this.config.chatIds[0]);
+    const ping = () => {
+      try {
+        Promise.resolve(this.telegram.sendChatAction({ chatId: target })).catch((err) =>
+          log.debug(`typing hint failed: ${err.message}`),
+        );
+      } catch (err) {
+        log.debug(`typing hint failed: ${err.message}`);
+      }
+    };
+
+    ping();
+    const timer = setInterval(ping, this.typingIntervalMs);
+    timer.unref?.();
+    return () => clearInterval(timer);
+  }
+
+  /**
+   * A completion reported by the agent hooks means the turn ended and the answer
+   * is already in Telegram. The prompt that caused it stops being watched, so its
+   * typing hint ends and the answer is not posted a second time later.
+   *
+   * @param {string} [agent]
+   */
+  /**
+   * Marks the running prompts a completion belongs to as answered, so their
+   * typing hint stops and the answer is not posted twice. This is bookkeeping: it
+   * happens before the notification checks below, because the turn really did end
+   * even when the user asked not to be notified of it.
+   *
+   * @param {string} agent
+   */
+  #finishPromptsAnsweredByHook(agent) {
+    for (const active of this.activePrompts.values()) {
+      if (agent && active.agent && active.agent !== agent) continue;
+      active.hookAnswered = true;
+      active.stopTyping?.();
     }
   }
 
@@ -240,12 +509,13 @@ export class Notifier {
         await this.sendStatus();
         return { handled: true, command: 'status' };
       case 'cancel': {
-        if (!command.arg) {
-          await this.sendText('Usage: <code>/cancel &lt;id&gt;</code>');
-          return { handled: true, command: 'cancel', ok: false };
+        if (!command.arg || /^(all|\*)$/i.test(command.arg)) {
+          const cancelled = this.cancelAll();
+          await this.sendText(cancelled ? `Cancelled ${cancelled} ongoing task(s).` : 'No ongoing tasks.');
+          return { handled: true, command: 'cancel', ok: cancelled > 0, cancelled };
         }
         const ok = this.cancel(command.arg);
-        await this.sendText(ok ? `Cancelled <code>${escapeText(command.arg)}</code>.` : `No pending request <code>${escapeText(command.arg)}</code>.`);
+        await this.sendText(ok ? `Cancelled <code>${escapeText(command.arg)}</code>.` : `Nothing is running with id <code>${escapeText(command.arg)}</code>.`);
         return { handled: true, command: 'cancel', ok };
       }
       case 'answer':
@@ -262,7 +532,458 @@ export class Notifier {
       if (newest) return await this.answerOption(newest.id, text);
     }
 
+    // Anything else can be a prompt for a new agent session, when that is enabled.
+    if (this.config.remotePromptEnabled) {
+      const running = this.#runningPromptFor(text, message.chat.id);
+      if (running) {
+        // A second delivery of the same prompt must not start the work twice.
+        log.warn(`prompt is already running as ${running.id}; the duplicate was ignored`);
+        return { handled: true, command: 'prompt', ok: false, duplicate: true, promptId: running.id };
+      }
+      return await this.runRemotePrompt(text, message.chat.id);
+    }
+
     return { handled: false, reason: 'no-match' };
+  }
+
+  /**
+   * @param {string} prompt
+   * @param {string|number} chatId
+   */
+  #runningPromptFor(prompt, chatId) {
+    const normalize = (value) => String(value ?? '').replace(/\r\n/g, '\n').trim();
+    const wanted = normalize(prompt);
+    for (const active of this.activePrompts.values()) {
+      if (String(active.chatId) !== String(chatId)) continue;
+      if (normalize(active.prompt) === wanted) return active;
+    }
+    return null;
+  }
+
+  /**
+   * Runs the message as a prompt for the agent that was used last, and posts the
+   * answer back to the chat.
+   *
+   * Copilot, Claude and OpenCode accept a prompt through the editor, where the
+   * session is visible. Claude and OpenCode also have their own runtime: Claude
+   * falls back to it when Chat will not take the prompt (a bridge outside VS Code,
+   * or a window that refuses the command), and OpenCode always runs there because
+   * its sidebar has no prompt command yet.
+   *
+   * @param {string} prompt
+   * @param {string|number} chatId
+   */
+  async runRemotePrompt(prompt, chatId) {
+    const agent = this.lastAgent;
+    this.promptSeq += 1;
+    const id = `p${Date.now().toString(36)}${this.promptSeq.toString(36)}`;
+    const active = this.#trackPrompt({ id, agent, prompt, chatId });
+    log.info(`remote prompt ${id} → ${agent} (${prompt.length} chars)`);
+
+    try {
+      // A Claude prompt belongs in the Claude session the user has in front of
+      // them, which only the editor can reach; OpenCode has no prompt command, so
+      // it runs in its own runtime instead.
+      if (agent === 'opencode' || (agent === 'claude' && !this.submitPrompt)) {
+        active.stopTyping = this.#startTyping(chatId);
+        return await this.#runCliPrompt({ id, prompt, chatId, agent, active });
+      }
+
+      if (!this.submitPrompt) {
+        // A bridge started from a terminal has no editor to submit to. Say so
+        // instead of pretending the prompt was accepted.
+        log.warn('a remote prompt arrived, but this bridge is not inside VS Code');
+        await this.sendText(
+          '✖ Remote prompts need the VS Code extension: start TelegramNotify from VS Code, then send the prompt again.',
+          chatId,
+        );
+        return { handled: true, command: 'prompt', ok: false, agent, error: 'not running inside VS Code' };
+      }
+
+      active.stopTyping = this.#startTyping(chatId);
+      return await this.#runEditorPrompt({
+        id,
+        prompt,
+        chatId,
+        agent,
+        active,
+        // A window that will not take the prompt (no Chat session on screen, a
+        // command that is unavailable) must not swallow it: Claude's own runtime
+        // still answers it.
+        fallback:
+          agent === 'claude'
+            ? () => this.#runCliPrompt({ id, prompt, chatId, agent, active })
+            : undefined,
+      });
+    } finally {
+      active.stopTyping?.();
+      active.stopTyping = () => {};
+      this.activePrompts.delete(id);
+    }
+  }
+
+  /**
+   * Runs the prompt through the agent's own runtime and posts the answer.
+   *
+   * Claude runs through its CLI when the editor will not take the prompt. The CLI
+   * is the same runtime the extension drives, so the turn is resumed into the
+   * session the panel shows and runs in that session's permission mode (no
+   * approval round trip for what the panel would have allowed). Nothing is posted
+   * while it runs: the answer arrives in one message when the turn ends, the same
+   * way a Copilot answer does.
+   *
+   * OpenCode prefers its HTTP server, because a turn run there is streamed to the
+   * OpenCode sidebar and the desktop app while it happens; `opencode run` is the
+   * fallback for when no server answers. Both continue the session the editor has
+   * open.
+   *
+   * @param {{ id: string, prompt: string, chatId: string|number, agent: string, active: any }} input
+   */
+  async #runCliPrompt({ id, prompt, chatId, agent, active }) {
+    const runner = agent === 'opencode' ? this.runOpenCodePrompt : this.runClaudePrompt;
+    const product = agent === 'opencode' ? 'OpenCode' : 'Claude Code';
+    // Only OpenCode has a session watcher that could report the same turn again.
+    const watcher = agent === 'opencode' ? this.openCodeWatcher : null;
+
+    await this.sendText(
+      [
+        `▶ <b>${escapeText(agent)}</b> is working on your prompt in ${product}.`,
+        `<blockquote>${escapeText(truncate(prompt, 300))}</blockquote>`,
+        `${product} runs the turn; the session is in its history and can be resumed there.`,
+      ].join('\n'),
+      chatId,
+    );
+
+    const result = await runner({
+      prompt,
+      cwd: typeof this.defaultCwd === 'function' ? this.defaultCwd() : this.defaultCwd || undefined,
+      signal: active.controller.signal,
+      // Sessions that another process reports on: an OpenCode turn also reaches the
+      // completion watcher, which would otherwise post the same turn twice, and a
+      // Claude turn joining the editor's session is the one the panel shows.
+      onSession: (sessionId) => {
+        watcher?.suppressNextTurn?.(sessionId);
+        if (sessionId) active.sessionId = String(sessionId);
+      },
+      // Put the conversation the turn belongs to on screen, so the prompt is visibly
+      // part of that session and the panel is one click from its history.
+      onJoined: (sessionId) => {
+        if (agent === 'claude' && sessionId) this.#focusClaudeSession(sessionId);
+      },
+      // A turn that stops to ask something is answered here first, then handed
+      // back: with a window the chat offers the same options the editor does, and
+      // an unanswered request simply stays in the panel where it already shows.
+      // Started, not awaited: the turn must keep being watched while the chat waits.
+      onWaiting: (ask) => {
+        void this.#answerWaiting({ agent, product, chatId, ask });
+      },
+    });
+    // A run that never produced a turn must not leave the session silenced. One
+    // that did — even a failed turn — is answered here, so the watcher must skip it
+    // instead of posting the same outcome a second time.
+    if (!result.ok && !result.turnSeen) watcher?.resumeReporting?.(result.sessionId);
+
+    if (active.cancelled || result.cancelled) {
+      return this.#cancelledPrompt(id, agent);
+    }
+    if (active.hookAnswered) {
+      // A hook already posted the answer; the CLI's output would repeat it.
+      log.info(`remote prompt ${id} ended when the ${product} hook reported the turn finished`);
+      return { handled: true, command: 'prompt', ok: true, agent, answeredByHook: true, sessionId: result.sessionId };
+    }
+    if (!result.ok) {
+      await this.sendText(
+        `✖ <b>${escapeText(agent)}</b> could not complete the prompt:\n${escapeText(truncate(result.error || 'unknown error', 1200))}`,
+        chatId,
+      );
+      return { handled: true, command: 'prompt', ok: false, agent, error: result.error };
+    }
+
+    const answer = formatAgentMessages(
+      {
+        type: 'completed',
+        title: `${agent} answered`,
+        message: result.text,
+        // Say where the turn went: a run that joined the editor's session is part of
+        // the conversation the panel shows, and one that started its own is a new
+        // entry in its history. Without this the prompt looks lost.
+        detail: result.resumed
+          ? 'This turn was added to the session Claude Code has open, so it is part of that conversation. Claude Code renders a session when it loads it, so reload or reopen that tab to see the turn there.'
+          : agent === 'claude'
+            ? 'No Claude Code session was open in this folder, so the turn started a new one (see the session list).'
+            : '',
+      },
+      this.config.maxMessageLength,
+    );
+    try {
+      // One message with the finished answer, the same way a Copilot turn is
+      // posted: no half-written copy on the way.
+      for (const part of answer) await this.telegram.sendMessage({ chatId: String(chatId), text: part });
+    } catch (err) {
+      log.error(`could not post the prompt answer: ${err.message}`);
+      return { handled: true, command: 'prompt', ok: false, agent, error: err.message };
+    }
+
+    return {
+      handled: true,
+      command: 'prompt',
+      ok: true,
+      agent,
+      sessionId: result.sessionId,
+      resumed: result.resumed || '',
+      permissionMode: result.permissionMode || '',
+      answer: result.text,
+    };
+  }
+
+  /**
+   * Waits until the hooks report the turn ended (or the prompt is cancelled), so
+   * the typing hint lives as long as the turn does. Bounded: a window without
+   * working hooks must not keep a prompt alive forever.
+   *
+   * @param {{ cancelled: boolean, hookAnswered: boolean }} active
+   */
+  async #waitForHookAnswer(active) {
+    const deadline = Date.now() + CLAUDE_HOOK_WAIT_MS;
+    while (!active.cancelled && !active.hookAnswered && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, CLAUDE_HOOK_POLL_MS));
+    }
+  }
+
+  /**
+   * Answers a request an agent's own turn is blocked on: Telegram asks first, the
+   * agent's own prompt takes over when the window closes.
+   *
+   * Only OpenCode reaches here — Claude and Copilot decide inside a hook process —
+   * and its panel keeps showing the request either way, so a Telegram answer is a
+   * second way in rather than a race.
+   *
+   * @param {{ agent: string, product: string, chatId: string|number, ask: any }} input
+   */
+  async #answerWaiting({ agent, product, chatId, ask }) {
+    const window = this.askWindowSeconds();
+    // No window: the panel or terminal is the only place that asks, exactly as the
+    // hooks do, so the chat is not given a request it cannot act on.
+    if (!window || typeof ask?.reply !== 'function') return;
+
+    const permission = ask.kind === 'permission';
+    const options = permission
+      ? OPENCODE_PERMISSION_OPTIONS
+      : Array.isArray(ask.fields?.[0]?.options)
+        ? ask.fields[0].options.slice(0, 6)
+        : [];
+
+    const result = await this.notify({
+      agent,
+      type: permission ? 'permission' : 'question',
+      title: truncate(ask.title || `${product} question`, 200),
+      message: ask.lines?.length
+        ? ask.lines.map((line) => truncate(line, 300)).join('\n')
+        : `${product} is waiting for you.`,
+      chatId,
+      options,
+      waitForReply: true,
+      timeoutSeconds: window,
+      replyPrompt: askReplyPrompt(window, `the ${product} panel asks`),
+    });
+
+    const answer = String(result?.answer ?? '').trim();
+    if (!answer) {
+      // The window closed: the panel still has the request, so nothing else to do.
+      log.info(`${product} request ${ask.id} was not answered in the chat; the panel keeps it`);
+      return;
+    }
+
+    try {
+      const answered = await ask.reply(answer, result?.optionIndex ?? null);
+      if (!answered) log.info(`${product} request ${ask.id} was answered in the panel first`);
+    } catch (err) {
+      log.warn(`could not answer ${product} request ${ask.id}: ${err.message}`);
+    }
+  }
+
+  /**
+   * How long the chat may hold a request before the agent's own prompt takes over.
+   * 0 when notifications are off: then only the panel or terminal asks.
+   *
+   * @returns {number}
+   */
+  askWindowSeconds() {
+    if (this.notificationsEnabled === false) return 0;
+    const window = Number(this.config.claudeAskWindowSeconds);
+    return Number.isFinite(window) && window > 0 ? Math.floor(window) : 0;
+  }
+
+  /**
+   * Brings the Claude Code session to the front, when the extension host allows it.
+   *
+   * The turn runs in that session, so opening it is what makes the prompt part of
+   * what the user is looking at rather than something invisible.
+   *
+   * @param {string} sessionId
+   */
+  #focusClaudeSession(sessionId) {
+    if (!this.openAgentSession || this.config.claudeOpenSession === false) return;
+    try {
+      Promise.resolve(this.openAgentSession({ agent: 'claude', sessionId })).catch((err) =>
+        log.debug(`could not open the Claude Code session: ${err.message}`),
+      );
+    } catch (err) {
+      log.debug(`could not open the Claude Code session: ${err.message}`);
+    }
+  }
+
+  /**
+   * Submits the prompt through the editor and tells the chat what happened.
+   * The answer stays in the editor, where the session is visible and manageable.
+   *
+   * @param {{ id: string, prompt: string, chatId: string|number, agent: string, active: any, fallback?: () => Promise<any> }} input
+   */
+  async #runEditorPrompt({ id, prompt, chatId, agent, active, fallback }) {
+    const since = Date.now();
+    let submitted;
+    try {
+      submitted = await this.submitPrompt({ agent, prompt });
+    } catch (err) {
+      // A submitter that throws is the same as one that refuses: the prompt still
+      // has to be answered.
+      submitted = { ok: false, outcome: 'unsupported', agent, error: err?.message || String(err) };
+    }
+
+    if (active.cancelled) return this.#cancelledPrompt(id, agent);
+    if (!submitted.ok && fallback) {
+      // Chat would not take it (no session on screen, or the command is missing):
+      // the agent's own runtime still answers the prompt.
+      log.info(`${agent} could not be submitted to Chat (${submitted.error || 'unknown error'}); using its runtime`);
+      return await fallback();
+    }
+    if (!submitted.ok) {
+      await this.sendText(
+        `✖ <b>${escapeText(agent)}</b> could not be started from here:\n${escapeText(truncate(submitted.error || 'unknown error', 800))}`,
+        chatId,
+      );
+      return { handled: true, command: 'prompt', ok: false, agent, error: submitted.error };
+    }
+
+    const where =
+      agent === 'copilot' || agent === 'claude'
+        ? 'VS Code Chat (the session is in your Chat list)'
+        : 'the OpenCode sidebar';
+
+    await this.sendText(
+      [
+        `▶ <b>${escapeText(agent)}</b> received your prompt in ${escapeText(where)}.`,
+        `<blockquote>${escapeText(truncate(prompt, 300))}</blockquote>`,
+        submitted.detail ? escapeText(submitted.detail) : '',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      chatId,
+    );
+
+    // A Claude turn has no Chat log the bridge can read: its `Stop` hook posts the
+    // transcript's complete answer when the turn ends. Waiting for that keeps the
+    // typing hint alive for the whole turn and stops the prompt (and its Stop
+    // button) from being dropped right after submission.
+    if (agent === 'claude') {
+      await this.#waitForHookAnswer(active);
+      if (active.cancelled) return this.#cancelledPrompt(id, agent);
+      return {
+        handled: true,
+        command: 'prompt',
+        ok: true,
+        agent,
+        submittedInEditor: true,
+        ...(active.hookAnswered ? { answeredByHook: true } : { answeredInEditor: true }),
+      };
+    }
+
+    // VS Code owns the session, and it persists every chat as an operation log;
+    // the answer is read from there so it can come back to Telegram too. The
+    // session stays visible and resumable in the Chat list either way.
+    if (!this.readChatReply) {
+      return { handled: true, command: 'prompt', ok: true, agent, outcome: submitted.outcome, submittedInEditor: true, promptId: id };
+    }
+
+    // The wait is deliberately unbounded: a long turn is not a failure, and the
+    // typing hint keeps the chat informed while it runs. The request's own state
+    // (finished, failed, stopped) or a hook completion ends it.
+    const reply = await this.readChatReply({
+      agent,
+      prompt,
+      sinceMs: since,
+      timeoutMs: 0,
+      shouldStop: () => active.cancelled || active.hookAnswered,
+    });
+
+    if (active.cancelled) return this.#cancelledPrompt(id, agent);
+    if (reply?.unsupported) {
+      // The acknowledgement already told the chat where the prompt went; there is
+      // nothing to wait for.
+      return { handled: true, command: 'prompt', ok: true, agent, submittedInEditor: true, answeredInEditor: true };
+    }
+    if (active.hookAnswered) {
+      // The agent hooks already posted the answer; posting the session text too
+      // would duplicate it.
+      log.info(`remote prompt ${id} ended when the agent reported the turn finished`);
+      return {
+        handled: true,
+        command: 'prompt',
+        ok: true,
+        agent,
+        submittedInEditor: true,
+        answeredByHook: true,
+        sessionId: reply?.sessionId,
+      };
+    }
+    if (reply.cancelled) {
+      // The Stop button in the Chat ends the request; the prompt is not running
+      // any more, so the chat is told rather than left waiting for a timeout.
+      log.info(`remote prompt ${id} was stopped in the chat`);
+      await this.sendText(USER_CANCELLED_TEXT, chatId);
+      return {
+        handled: true,
+        command: 'prompt',
+        ok: false,
+        cancelled: true,
+        agent,
+        submittedInEditor: true,
+        sessionId: reply.sessionId,
+      };
+    }
+    if (reply.timedOut) {
+      // A bounded wait (the CLI mode) ends with the answer already posted above;
+      // a timeout is not an outcome worth a message of its own.
+      return { handled: true, command: 'prompt', ok: Boolean(reply.ok), agent, submittedInEditor: true, sessionId: reply.sessionId };
+    }
+    if (!reply.ok || !reply.text) {
+      await this.sendText(
+        `ℹ <b>${escapeText(agent)}</b> finished, but the answer could not be read from the Chat session: ${escapeText(truncate(reply.error || 'no text yet', 400))}`,
+        chatId,
+      );
+      return { handled: true, command: 'prompt', ok: Boolean(reply.ok), agent, submittedInEditor: true, sessionId: reply.sessionId };
+    }
+
+    const answer = formatAgentMessages(
+      { type: 'completed', title: `${agent} answered`, message: reply.text },
+      this.config.maxMessageLength,
+    );
+    try {
+      for (const part of answer) await this.telegram.sendMessage({ chatId: String(chatId), text: part });
+    } catch (err) {
+      log.error(`could not post the prompt answer: ${err.message}`);
+      return { handled: true, command: 'prompt', ok: false, agent, error: err.message };
+    }
+
+    return {
+      handled: true,
+      command: 'prompt',
+      ok: true,
+      agent,
+      submittedInEditor: true,
+      sessionId: reply.sessionId,
+      answer: reply.text,
+    };
   }
 
   async answerCommand(arg) {
@@ -294,35 +1015,46 @@ export class Notifier {
     return { handled: true, requestId: entry.id, answer: text };
   }
 
-  async sendText(html) {
+  /**
+   * @param {string} html
+   * @param {string|number} [chatId] defaults to the first configured chat
+   */
+  async sendText(html, chatId) {
     try {
-      await this.telegram.sendMessage({ chatId: this.config.chatIds[0], text: html });
+      await this.telegram.sendMessage({ chatId: String(chatId ?? this.config.chatIds[0]), text: html });
     } catch (err) {
       log.error(`sendMessage failed: ${err.message}`);
     }
   }
 
   async sendHelp() {
-    await this.sendText(
-      [
-        '<b>TelegramNotify</b>',
-        'Replies reach the agent that raised the request.',
+    const lines = [
+      '<b>TelegramNotify</b>',
+      'Replies reach the agent that raised the request.',
+      '',
+      '/list — pending requests',
+      '/status — bridge status',
+      '/answer &lt;id&gt; &lt;text&gt; — answer by id',
+      '/1 … /8 — pick an option on the latest request',
+      '/cancel &lt;id&gt; — stop waiting and return to the agent',
+      '/cancel all — stop every waiting request and running prompt',
+      '',
+      'Or reply to the notification message. Requests expire after the configured timeout.',
+    ];
+    if (this.config.remotePromptEnabled) {
+      lines.push(
         '',
-        '/list — pending requests',
-        '/status — bridge status',
-        '/answer &lt;id&gt; &lt;text&gt; — answer by id',
-        '/1 … /8 — pick an option on the latest request',
-        '/cancel &lt;id&gt; — stop waiting and return to the agent',
-        '',
-        'Or reply to the notification message. Requests expire after the configured timeout.',
-      ].join('\n'),
-    );
+        `Any other message is sent as a prompt to <b>${escapeText(this.lastAgent)}</b> in VS Code Chat.`,
+      );
+    }
+    await this.sendText(lines.join('\n'));
   }
 
   async sendList() {
     const pending = this.pending.list();
-    if (!pending.length) {
-      await this.sendText('No pending requests.');
+    const running = [...this.activePrompts.values()];
+    if (!pending.length && !running.length) {
+      await this.sendText('No ongoing tasks.');
       return;
     }
     const lines = pending.map(
@@ -331,7 +1063,20 @@ export class Notifier {
           item.title ? escapeText(truncate(item.title, 60)) : '—'
         } · ${item.expiresInSeconds}s left`,
     );
-    await this.sendText(['<b>Pending requests</b>', ...lines].join('\n'));
+    const runningLines = running.map(
+      (item) =>
+        `<code>${item.id}</code> ${escapeText(item.agent || 'agent')} · prompt · ${escapeText(
+          truncate(item.prompt, 60),
+        )} · ${Math.round((Date.now() - item.startedAt) / 1000)}s`,
+    );
+    await this.sendText(
+      [
+        ...(lines.length ? ['<b>Waiting for an answer</b>', ...lines] : []),
+        ...(runningLines.length ? ['<b>Running prompts</b>', ...runningLines] : []),
+        '',
+        'Use <code>/cancel all</code> to stop everything.',
+      ].join('\n'),
+    );
   }
 
   async sendStatus() {
@@ -344,7 +1089,9 @@ export class Notifier {
         `ready: ${this.ready ? 'yes' : 'no'}`,
         `port: ${this.config.webhookPort}`,
         `pending: ${this.pending.size}`,
+        `running prompts: ${this.activePrompts.size}`,
         `agents: ${agents}`,
+        ...(this.config.remotePromptEnabled ? [`prompt agent: ${escapeText(this.lastAgent)}`] : []),
       ].join('\n'),
     );
   }

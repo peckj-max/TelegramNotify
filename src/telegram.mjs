@@ -1,6 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { TelegramError } from './errors.mjs';
+import { plainTextFromHtml } from './markdown.mjs';
 import { log } from './logger.mjs';
 
 const API_BASE = 'https://api.telegram.org';
@@ -117,18 +118,53 @@ export class TelegramClient {
 
   /** @param {{chatId: string, text: string, replyMarkup?: unknown}} message */
   sendMessage({ chatId, text, replyMarkup }) {
+    return this.sendHtml({ chatId, text, replyMarkup });
+  }
+
+  /**
+   * Sends HTML, falling back to plain text when Telegram rejects the markup.
+   * Losing the formatting is recoverable; losing the notification is not.
+   *
+   * @param {{chatId: string, text: string, replyMarkup?: unknown, plain?: string}} message
+   */
+  async sendHtml({ chatId, text, replyMarkup, plain }) {
+    try {
+      return await this.#sendMessage({ chatId, text, replyMarkup, html: true });
+    } catch (err) {
+      if (!this.#isParseError(err)) throw err;
+      const fallback = plain ?? plainTextFromHtml(text);
+      log.warn(`Telegram rejected the markup, resending as plain text: ${err.message}`);
+      return this.#sendMessage({ chatId, text: fallback, replyMarkup, html: false });
+    }
+  }
+
+  /**
+   * @param {{chatId: string, text: string, replyMarkup?: unknown, html: boolean}} message
+   */
+  #sendMessage({ chatId, text, replyMarkup, html }) {
     const payload = {
       chat_id: chatId,
       text,
-      parse_mode: 'HTML',
       disable_web_page_preview: true,
     };
+    if (html) payload.parse_mode = 'HTML';
     if (replyMarkup) payload.reply_markup = replyMarkup;
     return this.call('sendMessage', payload);
   }
 
-  /** @param {{chatId: string, messageId: number, text: string, replyMarkup?: unknown}} message */
-  editMessageText({ chatId, messageId, text, replyMarkup }) {
+  /**
+   * @param {unknown} err
+   */
+  #isParseError(err) {
+    return /can't parse entities|unsupported start tag|can't find end tag|unclosed/i.test(String(err?.message ?? ''));
+  }
+
+  /**
+   * Edits a message, falling back to plain text when Telegram rejects the markup.
+   *
+   * @param {{chatId: string, messageId: number, text: string, replyMarkup?: unknown}} message
+   */
+  async editMessageText({ chatId, messageId, text, replyMarkup }) {
     const payload = {
       chat_id: chatId,
       message_id: messageId,
@@ -137,13 +173,33 @@ export class TelegramClient {
       disable_web_page_preview: true,
     };
     if (replyMarkup !== undefined) payload.reply_markup = replyMarkup;
-    return this.call('editMessageText', payload);
+
+    try {
+      return await this.call('editMessageText', payload);
+    } catch (err) {
+      if (!this.#isParseError(err)) throw err;
+      log.warn(`Telegram rejected the edit markup, retrying as plain text: ${err.message}`);
+      const plain = { ...payload, text: plainTextFromHtml(text) };
+      delete plain.parse_mode;
+      return this.call('editMessageText', plain);
+    }
   }
 
   answerCallbackQuery({ callbackQueryId, text }) {
     const payload = { callback_query_id: callbackQueryId };
     if (text) payload.text = text;
     return this.call('answerCallbackQuery', payload);
+  }
+
+  /**
+   * Shows "typing…" in the chat. Telegram clears the hint after about five
+   * seconds, so a running prompt re-sends it instead of posting progress
+   * messages that pile up in the conversation.
+   *
+   * @param {{ chatId: string, action?: string }} options
+   */
+  sendChatAction({ chatId, action = 'typing' }) {
+    return this.call('sendChatAction', { chat_id: chatId, action }, { timeoutMs: 10000 });
   }
 
   /**

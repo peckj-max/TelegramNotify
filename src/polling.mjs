@@ -30,6 +30,8 @@ export class PollingReceiver {
     this.errors = 0;
     this.lastError = null;
     this.lastUpdateAt = null;
+    /** Updates being handled right now; a prompt can take minutes. */
+    this.inFlight = new Set();
   }
 
   get active() {
@@ -90,11 +92,7 @@ export class PollingReceiver {
           if (typeof update?.update_id === 'number') this.offset = update.update_id + 1;
           this.handled += 1;
           this.lastUpdateAt = new Date().toISOString();
-          try {
-            await this.onUpdate(update);
-          } catch (err) {
-            log.error(`polling handler failed: ${err.message}`);
-          }
+          this.#dispatch(update);
         }
 
         // getUpdates normally blocks for `timeout` seconds. When something in
@@ -118,6 +116,20 @@ export class PollingReceiver {
         await this.#sleep(this.retryDelayMs);
       }
     }
+  }
+
+  /**
+   * Runs the handler without holding the poll. A prompt runs for minutes, and
+   * awaiting it here would delay every later update — `/cancel` included.
+   *
+   * @param {any} update
+   */
+  #dispatch(update) {
+    const task = Promise.resolve()
+      .then(() => this.onUpdate(update))
+      .catch((err) => log.error(`polling handler failed: ${err.message}`))
+      .finally(() => this.inFlight.delete(task));
+    this.inFlight.add(task);
   }
 
   /**

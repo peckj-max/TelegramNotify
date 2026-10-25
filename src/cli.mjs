@@ -62,7 +62,6 @@ install options:
   --agent <name>        copilot | claude | opencode | all (default: all)
   --project <dir>       Project root (default: current directory)
   --global              Install into the user-level agent config where supported
-  --approvals           Copilot only: answer tool permissions from Telegram
 `;
 
 /**
@@ -175,6 +174,7 @@ async function serve(configOptions, flags, json) {
         `Delivery: ${config.webhookEnabled ? `webhook POST ${config.webhookPath} (X-Telegram-Bot-Api-Secret-Token required)` : `long polling every ${config.pollingTimeoutSeconds}s`}`,
         `Local API: POST ${base}/event/{${AGENTS.join('|')}} · GET ${base}/pending · GET ${base}/health`,
         `Agents: ${Object.entries(config.agents).map(([name, on]) => `${name}=${on ? 'on' : 'off'}`).join(' ')}`,
+        `Remote prompts: ${config.remotePromptEnabled ? 'on (VS Code Chat for Copilot; CLI for Claude and OpenCode)' : 'off'}`,
         notifier.ready ? 'Telegram: ready' : 'Telegram: NOT configured (set botToken and chatId)',
         '',
       ].join('\n'),
@@ -287,6 +287,16 @@ async function doctor(configOptions, json) {
   const pollingState = report.bridge.polling?.active ? `, polling (${report.bridge.polling.handled} update(s) handled)` : '';
   lines.push(`bridge           : ${bridgeState}${report.delivery === 'polling' ? pollingState : ''}`);
   lines.push(`agents           : ${Object.entries(report.agents).map(([name, on]) => `${name}=${on ? 'on' : 'off'}`).join(' ')}`);
+  if (config.remotePromptEnabled) {
+    lines.push('remote prompts   : on · via VS Code Chat (Copilot) or the agent CLI (Claude, OpenCode)');
+    lines.push(
+      config.sourcePath
+        ? '                   Copilot prompts need the extension in VS Code; Claude and OpenCode run headlessly'
+        : '                   Copilot prompts are submitted through the extension host',
+    );
+  } else {
+    lines.push('remote prompts   : off');
+  }
   process.stdout.write(`${lines.join('\n')}\n`);
   return failed ? 1 : 0;
 }
@@ -354,7 +364,6 @@ function installCommand(flags, json) {
   const result = install(root, {
     agent,
     global: Boolean(flags.global),
-    approvals: Boolean(flags.approvals),
   });
   if (json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   else {

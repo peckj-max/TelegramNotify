@@ -74,7 +74,9 @@ export function startServer(config, deps = {}) {
  * @param {PollingReceiver} [polling]
  */
 export function closeServer(server, notifier, polling) {
-  notifier.pending.cancelAll('shutdown');
+  // Stopping the bridge must also stop prompts that are still being watched;
+  // otherwise their progress heartbeats outlive the bridge.
+  notifier.cancelAll('shutdown');
   polling?.stop();
   return new Promise((resolve) => {
     server.closeAllConnections?.();
@@ -114,7 +116,20 @@ async function handle(req, res, config, notifier, startedAt, polling) {
 
   if (pathname === '/pending' && method === 'GET') {
     if (!isLoopback(req)) return sendJson(res, 403, { ok: false, error: 'local requests only' });
-    return sendJson(res, 200, { ok: true, pending: notifier.pending.list() });
+    return sendJson(res, 200, {
+      ok: true,
+      pending: notifier.pending.list(),
+      running: [...notifier.activePrompts.values()].map((item) => ({
+        id: item.id,
+        agent: item.agent,
+        startedAt: item.startedAt,
+      })),
+    });
+  }
+
+  if (pathname === '/tasks/cancel' && method === 'POST') {
+    if (!isLoopback(req)) return sendJson(res, 403, { ok: false, error: 'local requests only' });
+    return sendJson(res, 200, { ok: true, cancelled: notifier.cancelAll('cancelled') });
   }
 
   const cancelMatch = /^\/pending\/([0-9a-zA-Z-]{4,32})\/cancel$/.exec(pathname);
@@ -164,8 +179,14 @@ async function handleWebhook(req, res, config, notifier) {
     return sendJson(res, 400, { ok: false, error: 'invalid update' });
   }
 
-  const result = await notifier.handleUpdate(update);
-  return sendJson(res, 200, { ok: true, result });
+  // A prompt runs for minutes, but Telegram only waits a few seconds for this
+  // answer and then redelivers the update — which started the same prompt again
+  // and again. Acknowledge first, then handle it once, out of band.
+  sendJson(res, 200, { ok: true, accepted: true });
+
+  Promise.resolve()
+    .then(() => notifier.handleUpdate(update))
+    .catch((err) => log.error(`webhook update failed: ${err.message}`));
 }
 
 async function handleEvent(req, res, config, notifier, pathname) {

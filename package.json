@@ -57,6 +57,11 @@
         "category": "TelegramNotify"
       },
       {
+        "command": "telegramNotify.cancelAll",
+        "title": "Cancel All Ongoing Tasks",
+        "category": "TelegramNotify"
+      },
+      {
         "command": "telegramNotify.sendTest",
         "title": "Send Test Notification",
         "category": "TelegramNotify"
@@ -112,7 +117,7 @@
         "telegramNotify.agents.claude": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Send Claude Code events to Telegram, and return permission and question answers to it.",
+          "markdownDescription": "Send Claude Code events to Telegram, and return permission and question answers to it for a prompt Telegram started. A turn you start in the Chat panel or a terminal asks for approval there, like Copilot.",
           "order": 5
         },
         "telegramNotify.agents.opencode": {
@@ -145,7 +150,7 @@
           "default": 3800,
           "minimum": 200,
           "maximum": 4096,
-          "markdownDescription": "Upper bound for one Telegram message, below the 4096 character API limit.",
+          "markdownDescription": "Size of one Telegram message. Longer output is **split into several messages** (never truncated), each kept under this length.",
           "order": 10
         },
         "telegramNotify.webhookEnabled": {
@@ -194,6 +199,34 @@
           "markdownDescription": "Long-polling wait per Telegram request, used only when **Enable Webhook** is off. 25 keeps the reply latency low without hammering the API.",
           "order": 17
         },
+        "telegramNotify.remotePromptEnabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "**Accept prompts from Telegram.** A message that is not a command or an answer is run as a prompt for the agent used most recently (Copilot until another agent reports an event), and the answer is posted back to the chat. Copilot and Claude run in VS Code Chat, in the session on screen; a Claude prompt Chat cannot take falls back to Claude Code's own runtime.\n\nAnyone who can write in the configured chat can run the agent on this machine, so this is off by default.",
+          "order": 18
+        },
+        "telegramNotify.claudeOpenSession": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "**Show the Claude Code session.** Applies to the fallback path only: when Chat cannot take a Telegram prompt and it runs through Claude Code's own runtime, open the session it joined in its panel or sidebar, so the prompt belongs to a conversation you can see.\n\nThe fallback run resumes the session the editor has open and posts the complete answer to Telegram when the turn ends; Claude Code renders a session when it loads it, so reopen or reload that tab to see the turn.",
+          "order": 19
+        },
+        "telegramNotify.claudeAskWindowSeconds": {
+          "type": "number",
+          "default": 20,
+          "minimum": 0,
+          "maximum": 3600,
+          "markdownDescription": "**Ask a question in Telegram first.** Seconds a blocking agent question — Claude Code's `AskUserQuestion` — waits for an answer in the chat before its own prompt takes over.\n\nWith TelegramNotify on (the default) the chat gets the question's options first: tap one and the turn continues; if nothing answers within this window the message is replaced with `⌛ no answer after Ns`, its buttons are cleared, and the question is left to the panel or terminal. Whichever place answers first wins.\n\n`0` turns the Telegram step off, so only the panel or terminal asks. Permission requests are not routed through this window: they are reported after the agent's own prompt appears (see `panelWaitSeconds`), because a permission hook runs before the agent decides whether to ask at all.",
+          "order": 20
+        },
+        "telegramNotify.panelWaitSeconds": {
+          "type": "number",
+          "default": 20,
+          "minimum": 0,
+          "maximum": 3600,
+          "markdownDescription": "**Report prompts waiting in the panel.** Seconds a Copilot `permission.requested` or `ask_user` may stay unanswered before Telegram is told about it.\n\nThis is passive: no hook blocks, and the request is not answered from Telegram. It only fires when Copilot's own permission service or question prompt is actually waiting, so calls that are auto-approved are never reported. `0` turns the report off.",
+          "order": 21
+        },
         "telegramNotify.logLevel": {
           "type": "string",
           "default": "info",
@@ -205,7 +238,7 @@
             "debug"
           ],
           "markdownDescription": "Verbosity of the TelegramNotify output channel.",
-          "order": 18
+          "order": 22
         }
       }
     }

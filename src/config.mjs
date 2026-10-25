@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ConfigError } from './errors.mjs';
+import { ALL_SETTINGS } from './settings.mjs';
 
 export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -20,6 +21,16 @@ export const DEFAULTS = {
   notifyOnCompleted: true,
   notifyOnStart: false,
   maxMessageLength: 3800,
+  remotePromptEnabled: false,
+  claudeOpenSession: true,
+  // Seconds a permission/question waits in Telegram before it is handed to the
+  // prompt the editor or terminal shows. 0 turns the Telegram step off. Despite
+  // the name it governs every agent; it began as a Claude-only switch.
+  claudeAskWindowSeconds: 20,
+  // Seconds a permission or question may sit in the panel before Telegram is told.
+  // Unlike the ask window above this never blocks: the agent's own prompt owns the
+  // request, and the event log only says whether it is still waiting.
+  panelWaitSeconds: 20,
 };
 
 /**
@@ -39,6 +50,10 @@ export const DEFAULTS = {
  * @property {boolean} notifyOnCompleted
  * @property {boolean} notifyOnStart
  * @property {number} maxMessageLength
+ * @property {boolean} remotePromptEnabled
+ * @property {boolean} claudeOpenSession
+ * @property {number} claudeAskWindowSeconds
+ * @property {number} panelWaitSeconds
  * @property {string|null} sourcePath
  */
 
@@ -180,6 +195,12 @@ function asPositiveInt(value, fallback) {
   return Number.isInteger(number) && number > 0 ? number : fallback;
 }
 
+/** Like `asPositiveInt`, but 0 is a value of its own ("off"), not a fallback. */
+function asNonNegativeInt(value, fallback) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 ? number : fallback;
+}
+
 function splitChatIds(value) {
   if (Array.isArray(value)) return value.map((id) => String(id).trim()).filter(Boolean);
   if (value === undefined || value === null || value === '') return [];
@@ -227,8 +248,24 @@ export function normalizeConfig(raw, options = {}) {
     pollingTimeoutSeconds: asPositiveInt(raw.pollingTimeoutSeconds, DEFAULTS.pollingTimeoutSeconds),
     replyTimeoutSeconds: asPositiveInt(raw.replyTimeoutSeconds, DEFAULTS.replyTimeoutSeconds),
     notifyOnCompleted: asBoolean(raw.notifyOnCompleted, DEFAULTS.notifyOnCompleted),
-    notifyOnStart: asBoolean(raw.notifyOnStart, DEFAULTS.notifyOnStart),
+    notifyOnStart: asBoolean(env.TELEGRAM_NOTIFY_NOTIFY_ON_START ?? raw.notifyOnStart, DEFAULTS.notifyOnStart),
     maxMessageLength: asPositiveInt(raw.maxMessageLength, DEFAULTS.maxMessageLength),
+    remotePromptEnabled: asBoolean(
+      env.TELEGRAM_NOTIFY_REMOTE_PROMPT ?? raw.remotePromptEnabled,
+      DEFAULTS.remotePromptEnabled,
+    ),
+    claudeOpenSession: asBoolean(
+      env.TELEGRAM_NOTIFY_CLAUDE_OPEN_SESSION ?? raw.claudeOpenSession,
+      DEFAULTS.claudeOpenSession,
+    ),
+    claudeAskWindowSeconds: asNonNegativeInt(
+      env.TELEGRAM_NOTIFY_CLAUDE_ASK_WINDOW ?? raw.claudeAskWindowSeconds,
+      DEFAULTS.claudeAskWindowSeconds,
+    ),
+    panelWaitSeconds: asNonNegativeInt(
+      env.TELEGRAM_NOTIFY_PANEL_WAIT ?? raw.panelWaitSeconds,
+      DEFAULTS.panelWaitSeconds,
+    ),
     sourcePath: options.sourcePath ?? null,
   };
 
@@ -240,6 +277,7 @@ function normalizePath(value) {
   if (!raw) return DEFAULTS.webhookPath;
   return raw.startsWith('/') ? raw : `/${raw}`;
 }
+
 /**
  * @param {RuntimeConfig} config
  * @returns {string[]}
@@ -336,7 +374,7 @@ function readSettingsFile(file) {
     const text = fs.readFileSync(file, 'utf8');
     const document = parseJsonc(text);
     const raw = {};
-    for (const key of SETTING_KEYS) {
+    for (const key of ALL_SETTINGS) {
       const value = document[`telegramNotify.${key}`];
       if (value !== undefined) raw[key] = value;
     }
@@ -347,27 +385,6 @@ function readSettingsFile(file) {
     return null;
   }
 }
-
-/** The contributed setting names, without the `telegramNotify.` prefix. */
-const SETTING_KEYS = [
-  'notificationsEnabled',
-  'botToken',
-  'chatId',
-  'agents.copilot',
-  'agents.claude',
-  'agents.opencode',
-  'notifyOnCompleted',
-  'notifyOnStart',
-  'replyTimeoutSeconds',
-  'maxMessageLength',
-  'webhookEnabled',
-  'webhookPort',
-  'webhookHost',
-  'webhookPath',
-  'webhookSecretToken',
-  'publicUrl',
-  'pollingTimeoutSeconds',
-];
 
 /**
  * VS Code tolerates comments and trailing commas in settings.json.
@@ -408,7 +425,8 @@ export function writeConfigFile(file, contents) {
   const body = `${JSON.stringify(contents, null, 2).replace(/\n/g, '\r\n')}\r\n`;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(temporary, body, 'utf8');
+  // The file holds the bot token and webhook secret, so keep it owner-only.
+  fs.writeFileSync(temporary, body, { encoding: 'utf8', mode: 0o600 });
   fs.renameSync(temporary, file);
 }
 
