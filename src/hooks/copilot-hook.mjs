@@ -125,8 +125,17 @@ async function handleCompleted(eventName, input) {
   }
 
   // A host that repeats agentStop must not notify twice for the same turn. The
-  // transcript's message id identifies the turn; the text is the fallback.
-  if (!claimCompletion(sessionId, found.id || summary)) {
+  // transcript identifies the turn: its last message id, whether that turn reported
+  // its result, and its text. The reported flag matters because the host stops a turn
+  // that has not finished (no `task_complete`), nudges it, and then stops it again —
+  // both stops share the answer's message id, so id alone would swallow the second,
+  // finished one and the prompt would never reach the chat.
+  //
+  // With no text there is nothing to compare, and the turn must be reported rather
+  // than dropped: claimCompletion allows an empty key.
+  const content = found.text || summary || '';
+  const turnKey = content ? `${found.id}|${found.reported}|${content}` : '';
+  if (!claimCompletion(sessionId, turnKey)) {
     log.debug(`duplicate completion for session ${sessionId} ignored`);
     return finish(null);
   }
@@ -171,7 +180,8 @@ function markerDir() {
  * notification is allowed rather than silently suppressed.
  *
  * @param {string} sessionId
- * @param {string} turnKey transcript message id, or the text as a fallback
+ * @param {string} turnKey what identifies the turn; the caller decides (message id,
+ *   whether the turn reported its result, and its text)
  * @returns {boolean}
  */
 function claimCompletion(sessionId, turnKey) {

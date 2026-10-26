@@ -17,7 +17,35 @@ export function truncate(value, limit) {
 }
 
 /**
+ * A folder as Telegram should show it: the last part of the path, with a leading
+ * `…` when the rest was dropped. A phone cannot use the whole path, and the tail is
+ * what identifies the project.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+export function folderLabel(value) {
+  const text = String(value ?? '')
+    .trim()
+    .replace(/[\\/]+$/, '');
+  if (!text) return '';
+  // Keep the separators the path uses, so a POSIX path does not turn into a Windows one.
+  const separator = text.includes('\\') ? '\\' : '/';
+  const parts = text.split(/[\\/]/).filter(Boolean);
+  if (!parts.length) return '';
+  // A drive path of three parts still names the project and fits on a line.
+  const onDrive = /^[A-Za-z]:$/.test(parts[0]);
+  const rooted = !onDrive && /^[\\/]/.test(text);
+  if (parts.length <= 2) return `${rooted ? separator : ''}${parts.join(separator)}`;
+  if (onDrive && parts.length <= 3) return parts.join(separator);
+  return `…${separator}${parts.slice(-2).join(separator)}`;
+}
+
+/**
  * The message header: title, the agent facts, and the answering hint.
+ *
+ * The facts follow the editor's own style — the folder is a path, so it is shown as
+ * one: highlighted, and shortened to the part that identifies it.
  *
  * @param {object} request
  * @returns {string}
@@ -28,9 +56,9 @@ export function formatNotification(request) {
   const lines = [`<b>${escapeHtml(heading)}</b>`];
 
   const facts = [];
-  if (request.agent) facts.push(`agent: ${escapeHtml(request.agent)}`);
-  if (request.cwd) facts.push(`cwd: ${escapeHtml(truncate(request.cwd, 120))}`);
-  if (facts.length) lines.push(`<i>${facts.join(' · ')}</i>`);
+  if (request.agent) facts.push(`<i>${escapeHtml(request.agent)}</i>`);
+  if (request.cwd) facts.push(`<code>${escapeHtml(folderLabel(request.cwd))}</code>`);
+  if (facts.length) lines.push(facts.join(' · '));
 
   if (type === 'completed' && !request.message && !request.detail) {
     // A bare "finished" line tells the reader nothing; say what is known instead.

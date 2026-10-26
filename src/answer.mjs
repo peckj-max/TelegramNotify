@@ -73,3 +73,44 @@ export function mergeSnapshots(parts) {
 export function isToolPart(part) {
   return String(part?.type ?? '').startsWith('tool');
 }
+
+/**
+ * A host summary often opens with what the agent did rather than what it found
+ * ("Answered the factual question: …", "Provided a concise factual answer: …").
+ * The reader wants the finding, and the message already labels the summary, so that
+ * short lead-in is dropped.
+ *
+ * @param {string} summary
+ * @returns {string}
+ */
+export function withoutLeadIn(summary) {
+  const text = String(summary ?? '').trim();
+  const match = /^([A-Za-z][^:.\n]{0,80}):\s+([\s\S]+)$/.exec(text);
+  if (!match) return text;
+  const [, lead, rest] = match;
+  if (!/^(answered|provided|implemented|completed|fixed|added|updated|reviewed|investigated|verified|explained|summarised|summarized)\b/i.test(lead)) {
+    return text;
+  }
+  return rest.trim();
+}
+
+/**
+ * Puts the summary the host reported after the answer, the way the panel renders it:
+ * the answer, then `Task completed:`, then the summary.
+ *
+ * The answer is everything outside the collapsed rows, so it leads with its own
+ * formatting; the summary follows as the host wrote it. Both are sent, because the
+ * panel shows both — no comparison, and nothing is dropped.
+ *
+ * @param {string} answer
+ * @param {string} summary
+ * @returns {string}
+ */
+export function mergeAnswerAndSummary(answer, summary) {
+  const body = String(answer ?? '').trim();
+  const report = withoutLeadIn(summary).trim();
+  const label = '**Task completed:**';
+  if (!report) return body;
+  if (!body) return `${label}\n\n${report}`;
+  return `${body}\n\n${label}\n\n${report}`;
+}

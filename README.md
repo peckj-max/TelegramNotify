@@ -47,8 +47,16 @@ flowchart LR
 - **Reported once.** Every agent announces the same ending more than once —
   Copilot fires `agentStop` then `sessionEnd`, OpenCode `session.idle` then
   `session.execution.succeeded`, Claude Code `Stop` plus `SubagentStop`/
-  `TaskCompleted`. Each completion is claimed atomically per turn (keyed on the
-  transcript message id), so one finish produces one message.
+  `TaskCompleted`. Each completion is claimed atomically per turn — keyed on the
+  transcript's message id **together with whether the turn reported its result and its
+  text** — so one finish produces one message, while a turn the host stopped twice
+  (once before `task_complete`, once after) is still reported.
+- **The answer, then the panel's `Task completed:` note.** Everything outside the
+  collapsed thinking and tool rows is the answer, and it leads. When the turn reports
+  through `task_complete`, its summary follows under the **Task completed:** label the
+  panel uses — the two are concatenated exactly as the panel shows them, with no
+  comparison and nothing dropped. The only edit is the summary's own lead-in
+  ("Answered the factual question:"), which would otherwise repeat the label.
 - **One message per task, not per turn.** The Copilot agent host stops a turn that
   ended *without* calling `task_complete`, then nudges it to continue ("you have
   not yet marked the task as complete") and the agent finishes 10–20 s later. That
@@ -56,7 +64,9 @@ flowchart LR
   (default **15 s**), dropped when the host continues the session by itself, and
   replaced if a newer turn of the same session finishes first. A real new prompt in
   that window sends the held message instead of losing it. Holding happens in the
-  bridge, so the hook is answered at once and the agent's turn never waits.
+  bridge, so the hook is answered at once and the agent's turn never waits. The
+  host's nudge is not counted as a new turn, so the answer a reader saw is never cut
+  off by it.
 - **Two delivery modes.** Webhook mode registers a URL with Telegram and checks
   `X-Telegram-Bot-Api-Secret-Token` on every call; polling mode needs no public
   host at all. Either way only the configured chat ids are allowed to answer.
@@ -403,24 +413,48 @@ agent's own prompt appears is what keeps auto-approved calls out of the chat.
 ## Message formatting
 
 Agent output is Markdown, not plain text, so it is rendered for Telegram instead
-of being sent raw:
+of being sent raw. The result follows the editor's own look: what the panel
+highlights, the message highlights — the same files, the same headings, the same
+lists.
 
 | Input | Telegram |
 | --- | --- |
-| `## Heading` | bold line |
+| `# Heading`, `## Heading` | bold and underlined line |
+| `### Heading` and deeper | bold line |
 | `**bold**`, `*italic*`, `~~strike~~` | bold, italic, strike |
 | `` `code` `` | monospace word |
 | ```` ```fence``` ```` | monospace block |
 | `[text](https://…)` | real link |
+| `[name.cs](D:/…/name.cs:12)` | `<code>name.cs:12</code>` — a local path cannot be opened from Telegram |
+| `[the controller](D:/…/Controllers/RunCmdController.cs)` | `<code>Controllers/RunCmdController.cs</code>` — a label that names no file would hide what changed |
+| a path in plain text (`src/hooks/x.mjs:145`, `D:\…\Web.config`) | `<code>hooks/x.mjs:145</code>` — the last two parts, so the folder comes with the file |
 | `- item` / `  - item` | `•` / `◦` bullets |
+| `- [x] item` / `- [ ] item` | `☑` / `☐` |
+| `1. item` | `1.` kept, because the answer cross-references those numbers |
 | `> quote` | `▎` quote line |
 | `---` | a divider |
 | narrow table | aligned monospace block, separator row dropped |
 | wide table | one bullet per row with `column: value` pairs |
 
+A URL, a version (`v2.0.22`, `ASP.NET 4.8`) and an API route (`/api/session`) are
+left alone: only text that really is a file or a folder is highlighted.
+
+Every message starts with the same compact header — the agent, then the folder:
+
+```
+Copilot finished
+copilot · …\Extensions\TelegramNotify
+```
+
+The folder is shortened to the part that names the project (a drive path of up to
+three parts is kept whole, a deeper one becomes `…\last\two`): a phone cannot use
+the whole path, and the tail is what identifies it.
+
 Everything else is HTML-escaped, so agent output can never break the message or
 inject markup. If Telegram still rejects the markup — an older client, an
-unsupported tag — the message is resent as plain text rather than lost.
+unsupported tag — the message is resent as plain text rather than lost, and that
+plain form keeps the meaning: a code span becomes `` `…` ``, a heading keeps its
+`**…**`, and a fence keeps its ```` ``` ````.
 
 Long output is **split across several messages, never truncated**: each part stays
 within `maxMessageLength`, splits prefer a line break, tags are closed and
@@ -593,7 +627,7 @@ machine that never runs the extension.
 | `PreToolUse` (`AskUserQuestion`) | Telegram asks first for `claudeAskWindowSeconds`. A Telegram answer returns as a `permissionDecision: "deny"` reason (free text too; several questions as `a | b`); no answer leaves the question to the interface that shows it. |
 | `Notification` | Reports the prompt Claude Code already shows. A permission notification ("Claude needs your permission to use …") is posted as a permission report with no buttons, so it is answered in the panel or terminal; anything else is posted as an attention message. |
 | `UserPromptSubmit` | Tells the bridge that Claude is the agent in use, so the next Telegram prompt goes to Claude, and records the prompt as a running prompt until `Stop`. Silent unless `notifyOnStart` is on. |
-| `Stop`, `SubagentStop`, `TaskCompleted` | Completion notification. The answer is read from the tail of the transcript: the `task_complete` summary when the host ended the turn with it, otherwise the closing block of assistant messages that do not come with a tool call. |
+| `Stop`, `SubagentStop`, `TaskCompleted` | Completion notification. The answer is everything outside the collapsed rows; the `task_complete` summary follows it under the **Task completed:** label, as the panel renders it. |
 
 No `PermissionRequest` hook is installed. It ran before Claude Code decided
 whether to ask, so it also caught calls that would have been approved by the
@@ -797,7 +831,6 @@ from the Copilot watcher is the same shape with no `options` and no
   exits `0` with no decision, leaving the normal terminal prompt in place.
 
 ## Troubleshooting
-
 | Symptom | Check |
 | --- | --- |
 | `401 invalid secret token` in the log | `webhookSecretToken` differs from what is registered. Run `webhook set` after changing it. |

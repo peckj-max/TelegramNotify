@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { answerOf, isToolPart } from '../answer.mjs';
+import { answerOf, isToolPart, mergeAnswerAndSummary } from '../answer.mjs';
 import { log } from '../logger.mjs';
 
 /** Windows to try, smallest first: most turns finish inside the first one. */
@@ -84,8 +84,14 @@ export function hasToolWorkOf(entry) {
 export function isUserEntry(entry) {
   const type = String(entry?.type ?? '');
   if (type === 'user.message') {
-    const text = entry?.data?.content;
-    return typeof text === 'string' ? !isSystemPromptOf(text) : true;
+    // The host's own prompt is marked as an autopilot continuation and keeps the
+    // nudge in `transformedContent`; either sign means the task, not a new question.
+    if (entry?.data?.isAutopilotContinuation === true) return false;
+    const text = [entry?.data?.content, entry?.data?.transformedContent].filter(
+      (value) => typeof value === 'string',
+    );
+    if (text.length) return !text.some(isSystemPromptOf);
+    return true;
   }
   if (type !== 'user') return false;
 
@@ -257,12 +263,59 @@ export function taskSummaryOf(entries) {
 }
 
 /**
+ * Whether an entry is the agent reporting its result rather than working: the
+ * `task_complete` call and the session event that mirrors it. They come *after* the
+ * answer, so they must not hide it.
+ *
+ * @param {any} entry
+ * @returns {boolean}
+ */
+function isReportStep(entry) {
+  if (String(entry?.type ?? '') === 'session.task_complete') return true;
+  if (!isAssistantEntry(entry)) return false;
+  if (assistantTextOf(entry)) return false;
+  const requests = [entry?.data?.toolRequests, entry?.toolRequests].filter(Array.isArray).flat();
+  return requests.length > 0 && requests.every((request) => /task[_-]?complete/i.test(String(request?.name ?? '')));
+}
+
+/**
+ * The text of the turn that ends at `entries`.
+ *
+ * The answer is what the panel shows outside the collapsed thinking and tool rows:
+ * the trailing block of assistant messages that do not come with a tool call. The
+ * `task_complete` summary is only a fallback, because it paraphrases that answer and
+ * often opens with a meta remark ("Answered the factual question: …") that the
+ * reader does not need.
+ *
+ * @param {any[]} turn entries of one turn
+ * @param {number} [start] index in `turn` where the answer may begin
+ * @returns {string}
+ */
+function answerTextOf(turn, start = 0) {
+  const items = [];
+  for (const entry of turn.slice(start)) {
+    if (isAssistantEntry(entry)) {
+      items.push({
+        text: assistantTextOf(entry),
+        toolWork: hasToolWorkOf(entry),
+        // Reporting the result is not a step of the work: it must not end the block.
+        step: !isReportStep(entry),
+      });
+    } else if (hasToolWorkOf(entry)) {
+      // A tool result or execution log still marks where the last step ended.
+      items.push({ text: '', toolWork: true });
+    }
+  }
+  return answerOf(items);
+}
+
+/**
  * The assistant text of the turn that ends at `entries`.
  *
- * Only the answer is returned: what the agent host reported as the task result, or
- * else the trailing block of agent messages that do not come with a tool call.
- * Everything before it narrates the work ("let me look at the file"), and a
- * cumulative snapshot of one message is collapsed so the same sentence is not
+ * Only the answer is returned: the trailing block of agent messages that do not come
+ * with a tool call, and the `task_complete` summary when the turn has no answer text
+ * of its own. Everything before it narrates the work ("let me look at the file"), and
+ * a cumulative snapshot of one message is collapsed so the same sentence is not
  * posted twice.
  *
  * `reported` says whether the turn ended by reporting its result through
@@ -275,23 +328,15 @@ export function taskSummaryOf(entries) {
 export function turnOf(entries) {
   if (!Array.isArray(entries) || !entries.length) return { text: '', id: '', reported: false };
 
-  let start = 0;
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    if (isUserEntry(entries[index])) {
-      start = index + 1;
-      break;
-    }
-  }
-
+  const start = turnStart(entries);
   const turn = entries.slice(start);
-  const items = [];
-  for (const entry of turn) {
-    if (isAssistantEntry(entry)) {
-      items.push({ text: assistantTextOf(entry), toolWork: hasToolWorkOf(entry), step: true });
-    } else if (hasToolWorkOf(entry)) {
-      // A tool result or execution log still marks where the last step ended.
-      items.push({ text: '', toolWork: true });
-    }
+  let text = answerTextOf(turn);
+
+  // A turn that only reported its result has no answer of its own: the text the
+  // reader saw is the previous turn's. That is the turn the host nudged to finish.
+  if (!text && reportedTaskComplete(turn)) {
+    const previous = turnStart(entries, start - 1);
+    text = answerTextOf(entries.slice(previous, start));
   }
 
   let id = '';
@@ -302,13 +347,30 @@ export function turnOf(entries) {
     break;
   }
 
-  const text = taskSummaryOf(turn) || answerOf(items);
+  const summary = reportedTaskComplete(turn) ? taskSummaryOf(turn) : '';
+  // The answer leads; the summary is merged in only for what it adds, because the
+  // two describe the same work.
+  const answer = mergeAnswerAndSummary(text, summary).trim();
 
   // A pathological answer is not worth more than the cap; keep its end, where the
   // conclusion is.
-  const capped = text.length > MAX_TEXT ? `…\n\n${text.slice(text.length - MAX_TEXT)}` : text;
+  const capped = answer.length > MAX_TEXT ? `…\n\n${answer.slice(answer.length - MAX_TEXT)}` : answer;
 
   return { text: capped.trim(), id, reported: reportedTaskComplete(turn) };
+}
+
+/**
+ * Where the turn that ends at `from` begins: the entry after its user message.
+ *
+ * @param {any[]} entries
+ * @param {number} [from] index to search backwards from, inclusive
+ * @returns {number}
+ */
+function turnStart(entries, from = entries.length - 1) {
+  for (let index = Math.min(from, entries.length - 1); index >= 0; index -= 1) {
+    if (isUserEntry(entries[index])) return index + 1;
+  }
+  return 0;
 }
 
 /**

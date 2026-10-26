@@ -26,8 +26,46 @@ export function escapeHtml(value) {
 }
 
 /**
+ * A path an agent writes when it means "this file": a Windows drive path, a POSIX
+ * path, a `./`-relative one, or a relative `folder/file.ext`, optionally with a
+ * `:line` suffix. The extension is required, so a bare word is never mistaken for a
+ * file, and the match may not stop at a dotted folder name.
+ */
+const FILE_PATH =
+  /(?:[A-Za-z]:[\\/]|\/|\.\/|(?:[A-Za-z0-9_.-]+[\\/])+)[^\s<>"'`|]*?[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,8}(?::\d+)?(?![\w/\\])/g;
+
+/**
+ * A folder, which has no extension to recognise: a drive letter and at least two
+ * segments, so `C:\Windows` reads as a path but `C:` on its own does not.
+ */
+const FOLDER_PATH = /(?<![\w\\/])[A-Za-z]:[\\/](?:[^\s<>"'`|\\/:]+\\)+[^\s<>"'`|\\/:.,;)]+/g;
+
+/** Text that is a URL, not a path: it keeps its own form. */
+const URL_TEXT = /(\bhttps?:\/\/[^\s<>"'`]+)/g;
+
+/**
+ * How a path is shown: its last two parts, so the folder that identifies the file
+ * comes with it (`hooks/transcript.mjs:145`), plus the line the agent pointed at.
+ *
+ * @param {string} path
+ * @returns {string}
+ */
+function fileLabel(path) {
+  const value = String(path);
+  const line = /:(\d+)$/.exec(value)?.[1] ?? '';
+  const body = line ? value.slice(0, -(line.length + 1)) : value;
+  const parts = body.split(/[\\/]+/).filter(Boolean);
+  const tail = parts.length > 2 ? parts.slice(-2).join('/') : parts.join('/');
+  return `${tail}${line ? `:${line}` : ''}`;
+}
+
+/**
  * Inline Markdown inside one already-escaped line. The input has been through
  * `escapeHtml`, so only attribute quotes still need escaping.
+ *
+ * A link to a local file cannot be opened from Telegram, so it is shown the way
+ * the editor shows it — the file name highlighted, with its line number. http(s)
+ * links stay links.
  *
  * @param {string} line
  * @returns {string}
@@ -40,8 +78,18 @@ function inlineMarkdown(line) {
     return `\u0000${codeSpans.length - 1}\u0000`;
   });
 
-  text = text.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => {
-    return `<a href="${url.replace(/"/g, '&quot;')}">${label}</a>`;
+  text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (whole, label, target) => {
+    // `target` is already HTML-escaped, so it goes into the attribute unchanged.
+    if (/^https?:\/\//i.test(target)) {
+      return `<a href="${target.replace(/"/g, '&quot;')}">${label}</a>`;
+    }
+    // A local path cannot be opened from Telegram, so it is shown the way the
+    // editor shows it: highlighted, with its line. A label that names no file
+    // ("the controller", "here") would hide what was changed, so the path wins.
+    const line = /:(\d+)$/.exec(target)?.[1] ?? '';
+    const named = /[^\\/]+\.\w{1,8}$/.test(label);
+    const shown = named ? label : fileLabel(target);
+    return `<code>${shown}${named && line ? `:${line}` : ''}</code>`;
   });
 
   text = text
@@ -51,7 +99,40 @@ function inlineMarkdown(line) {
     .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, '$1<i>$2</i>')
     .replace(/(^|[\s(])_([^_\n]+)_(?=[\s).,!?:;]|$)/g, '$1<i>$2</i>');
 
-  return text.replace(/\u0000(\d+)\u0000/g, (_, index) => `<code>${codeSpans[Number(index)]}</code>`);
+  text = text.replace(/\u0000(\d+)\u0000/g, (_, index) => `<code>${codeSpans[Number(index)]}</code>`);
+
+  return highlightPaths(text);
+}
+
+/**
+ * Highlights a path the agent wrote as plain text, the same way a link to a file is
+ * highlighted. Tags are skipped, so neither an `href` nor the text of a code span is
+ * rewritten, and a URL keeps its own form.
+ *
+ * @param {string} html
+ * @returns {string}
+ */
+function highlightPaths(html) {
+  let insideCode = false;
+  return html
+    .split(/(<\/?[a-zA-Z][^>]*>)/g)
+    .map((piece) => {
+      if (piece.startsWith('<')) {
+        if (/^<code[\s>]/i.test(piece)) insideCode = true;
+        else if (/^<\/code>/i.test(piece)) insideCode = false;
+        return piece;
+      }
+      if (insideCode) return piece;
+      return piece
+        .split(URL_TEXT)
+        .map((part) =>
+          /^https?:\/\//i.test(part)
+            ? part
+            : part.replace(FILE_PATH, (path) => `<code>${fileLabel(path)}</code>`).replace(FOLDER_PATH, (folder) => `<code>${folder}</code>`),
+        )
+        .join('');
+    })
+    .join('');
 }
 
 function isSeparatorRow(line) {
@@ -72,6 +153,19 @@ function splitRow(line) {
     .replace(/\|$/, '')
     .split('|')
     .map((cell) => cell.trim());
+}
+
+/**
+ * A checklist item becomes a ticked or empty box, the way the session draws it.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function taskStateOf(text) {
+  const value = String(text);
+  if (/^\[[xX]\]\s+/.test(value)) return `☑ ${value.replace(/^\[[xX]\]\s+/, '')}`;
+  if (/^\[ \]\s+/.test(value)) return `☐ ${value.replace(/^\[ \]\s+/, '')}`;
+  return value;
 }
 
 /**
@@ -179,7 +273,11 @@ export function markdownToTelegramHtml(value) {
 
     const heading = /^(#{1,6})\s+(.*)$/.exec(line);
     if (heading) {
-      blocks.push(`<b>${inlineMarkdown(escapeHtml(heading[2].trim()))}</b>`);
+      const title = inlineMarkdown(escapeHtml(heading[2].trim()));
+      const level = heading[1].length;
+      // The session shows `#`/`##` above the body; Telegram has no font sizes, so the
+      // top two levels are underlined as well as bold and deeper ones stay bold.
+      blocks.push(level <= 2 ? `<b><u>${title}</u></b>` : `<b>${title}</b>`);
       index += 1;
       continue;
     }
@@ -195,7 +293,18 @@ export function markdownToTelegramHtml(value) {
       // Telegram collapses leading spaces, so nesting is shown by the marker.
       const depth = Math.floor(bullet[1].replace(/\t/g, '  ').length / 2);
       const marker = depth === 0 ? '•' : depth === 1 ? '◦' : '▪';
-      blocks.push(`${marker} ${inlineMarkdown(escapeHtml(bullet[2]))}`);
+      blocks.push(`${marker} ${inlineMarkdown(escapeHtml(taskStateOf(bullet[2])))}`);
+      index += 1;
+      continue;
+    }
+
+    const ordered = /^(\s*)(\d{1,3})[.)]\s+(.*)$/.exec(line);
+    if (ordered) {
+      // The number the agent wrote is kept: it is what a cross-reference in the
+      // answer points at ("see step 2").
+      const depth = Math.floor(ordered[1].replace(/\t/g, '  ').length / 2);
+      const indent = depth > 0 ? `${'  '.repeat(Math.min(depth, 3))}` : '';
+      blocks.push(`${indent}${ordered[2]}. ${inlineMarkdown(escapeHtml(taskStateOf(ordered[3])))}`);
       index += 1;
       continue;
     }
@@ -368,6 +477,10 @@ const ENTITIES = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;
 /**
  * Strips the tags and unescapes entities, used when Telegram refuses HTML.
  *
+ * A refused message must still be readable, so the parts that were carrying meaning
+ * keep a plain-text form: a code span is wrapped in backticks, a bold heading is
+ * marked with a leading `›`, and a quote keeps its bar.
+ *
  * @param {string} html
  * @returns {string}
  */
@@ -375,6 +488,10 @@ export function plainTextFromHtml(html) {
   return String(html ?? '')
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/(p|pre|blockquote)>/gi, '\n')
+    .replace(/<code>([^<]*)<\/code>/gi, '`$1`')
+    .replace(/<pre>([\s\S]*?)<\/pre>/gi, '```\n$1\n```')
+    .replace(/<b>([^<]*)<\/b>/gi, '**$1**')
+    .replace(/<i>([^<]*)<\/i>/gi, '_$1_')
     .replace(/<[^>]+>/g, '')
     .replace(/&(amp|lt|gt|quot|#39);/g, (entity) => ENTITIES[entity] ?? entity);
 }
