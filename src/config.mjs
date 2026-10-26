@@ -31,6 +31,10 @@ export const DEFAULTS = {
   // Unlike the ask window above this never blocks: the agent's own prompt owns the
   // request, and the event log only says whether it is still waiting.
   panelWaitSeconds: 20,
+  // Seconds a completion is held when its turn stopped without reporting a result.
+  // The Copilot agent host nudges such a turn to continue, and that nudge drops the
+  // held message instead of Telegram showing an answer that is immediately overtaken.
+  completionHoldSeconds: 15,
 };
 
 /**
@@ -54,6 +58,7 @@ export const DEFAULTS = {
  * @property {boolean} claudeOpenSession
  * @property {number} claudeAskWindowSeconds
  * @property {number} panelWaitSeconds
+ * @property {number} completionHoldSeconds
  * @property {string|null} sourcePath
  */
 
@@ -265,6 +270,10 @@ export function normalizeConfig(raw, options = {}) {
     panelWaitSeconds: asNonNegativeInt(
       env.TELEGRAM_NOTIFY_PANEL_WAIT ?? raw.panelWaitSeconds,
       DEFAULTS.panelWaitSeconds,
+    ),
+    completionHoldSeconds: asNonNegativeInt(
+      env.TELEGRAM_NOTIFY_COMPLETION_HOLD ?? raw.completionHoldSeconds,
+      DEFAULTS.completionHoldSeconds,
     ),
     sourcePath: options.sourcePath ?? null,
   };

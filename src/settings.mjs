@@ -33,6 +33,7 @@ export const ALL_SETTINGS = [
   'claudeOpenSession',
   'claudeAskWindowSeconds',
   'panelWaitSeconds',
+  'completionHoldSeconds',
 ];
 
 /**
@@ -64,6 +65,7 @@ export function configFromSettings(settings = {}) {
     claudeOpenSession: settings.claudeOpenSession,
     claudeAskWindowSeconds: settings.claudeAskWindowSeconds,
     panelWaitSeconds: settings.panelWaitSeconds,
+    completionHoldSeconds: settings.completionHoldSeconds,
   };
   for (const key of Object.keys(raw)) {
     if (raw[key] === undefined || raw[key] === null) delete raw[key];

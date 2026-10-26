@@ -227,6 +227,14 @@
           "markdownDescription": "**Report prompts waiting in the panel.** Seconds a Copilot `permission.requested` or `ask_user` may stay unanswered before Telegram is told about it.\n\nThis is passive: no hook blocks, and the request is not answered from Telegram. It only fires when Copilot's own permission service or question prompt is actually waiting, so calls that are auto-approved are never reported. `0` turns the report off.",
           "order": 21
         },
+        "telegramNotify.completionHoldSeconds": {
+          "type": "number",
+          "default": 15,
+          "minimum": 0,
+          "maximum": 600,
+          "markdownDescription": "**One message per task, not per turn.** Seconds a finished turn is held when it stopped *without* reporting its result (no `task_complete`).\n\nThe Copilot agent host stops such a turn, then nudges it to continue (\"you have not yet marked the task as complete\") and the agent finishes moments later. A held completion is dropped when that nudge arrives, replaced when a newer turn of the same session finishes, and sent first when a real new prompt starts in that window, so nothing is lost. `0` sends every completion at once.",
+          "order": 22
+        },
         "telegramNotify.logLevel": {
           "type": "string",
           "default": "info",

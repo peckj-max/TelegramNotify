@@ -109,6 +109,44 @@ export function belongsTo(sessionDirectory, directories) {
   });
 }
 
+/**
+ * The turn a session is working on right now, or null when it is idle.
+ *
+ * A turn is running until an `idle` message follows its user message. This is how a
+ * prompt typed into the OpenCode panel or terminal — one the bridge did not start —
+ * becomes visible as a running prompt.
+ *
+ * @param {any[]} messages oldest first
+ * @returns {{ id: string, prompt: string, startedAt: number }|null}
+ */
+export function runningTurnOf(messages) {
+  if (!Array.isArray(messages) || !messages.length) return null;
+
+  let user = null;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.type === 'idle') return null; // the newest turn already finished
+    if (message?.type === 'user') {
+      user = message;
+      break;
+    }
+  }
+  if (!user) return null;
+
+  const prompt = Array.isArray(user.content)
+    ? user.content
+        .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+        .map((part) => part.text)
+        .join('\n')
+    : String(user.text ?? '');
+
+  return {
+    id: String(user.id ?? ''),
+    prompt: prompt.trim(),
+    startedAt: Number(user.time?.created ?? 0),
+  };
+}
+
 /** @param {OpenCodeEndpoint} endpoint */
 function authHeader(endpoint) {
   if (!endpoint.password) return {};
@@ -820,14 +858,18 @@ export class OpenCodeWatcher {
    * @param {() => (OpenCodeEndpoint|null)} options.endpoint
    * @param {() => string|string[]|undefined} [options.directory] open folder(s)
    * @param {(turn: { sessionId: string, title: string, text: string, error: string, outcome: string }) => Promise<void>|void} options.onCompleted
+   * @param {(turn: { sessionId: string, title: string, prompt: string, startedAt: number }) => void} [options.onStarted] a turn began outside the bridge (panel or terminal)
+   * @param {(turn: { sessionId: string }) => void} [options.onFinished] that turn is no longer running
    * @param {(baseUrl: string) => void} [options.onConnect] called when the server starts answering
    * @param {(level: 'info'|'warn'|'debug', message: string) => void} [options.log] receives the watcher's log lines
    * @param {number} [options.intervalMs]
    */
-  constructor({ endpoint, directory, onCompleted, onConnect, log: logger, intervalMs = 5000 }) {
+  constructor({ endpoint, directory, onCompleted, onStarted, onFinished, onConnect, log: logger, intervalMs = 5000 }) {
     this.getEndpoint = endpoint;
     this.getFolderList = directory ?? (() => undefined);
     this.onCompleted = onCompleted;
+    this.onStarted = onStarted;
+    this.onFinished = onFinished;
     this.onConnect = onConnect;
     this.emitLog = logger;
     this.intervalMs = Math.max(1000, intervalMs);
@@ -846,6 +888,8 @@ export class OpenCodeWatcher {
      * `idle`, so comparing `updated` alone would hide every completion.
      */
     this.touched = new Map();
+    /** session id → user message id of the turn it is running right now */
+    this.started = new Map();
     /** whether the last poll reached the server */
     this.reachable = false;
     this.seeded = false;
@@ -934,6 +978,21 @@ export class OpenCodeWatcher {
     log[level]?.(message);
   }
 
+  /**
+   * Stops the turn a session is running, the way the panel's stop button does.
+   *
+   * @param {string} sessionId
+   * @returns {Promise<boolean>}
+   */
+  async interrupt(sessionId) {
+    const endpoint = this.getEndpoint();
+    if (!endpoint) return false;
+    const [folder] = this.folders();
+    const stopped = await interruptSession(endpoint, sessionId, { directory: folder });
+    if (stopped) this.started.delete(String(sessionId));
+    return stopped;
+  }
+
   /** One poll: inspect only sessions whose last activity is new. */
   async tick() {
     if (this.running) return;
@@ -968,6 +1027,27 @@ export class OpenCodeWatcher {
         });
         this.touched.set(session.id, stamp);
         inspected += 1;
+
+        // A turn the user started in the panel or the terminal is running, and the
+        // bridge did not start it: report it so /status and /cancel see it too. A
+        // turn the bridge answered from Telegram is already tracked there.
+        const running = runningTurnOf(messages);
+        const startedId = this.started.get(session.id);
+        if (!this.answered.has(session.id)) {
+          if (running && running.id && running.id !== startedId) {
+            this.started.set(session.id, running.id);
+            this.onStarted?.({
+              sessionId: session.id,
+              title: session.title,
+              prompt: running.prompt,
+              startedAt: running.startedAt,
+            });
+          } else if (!running && startedId) {
+            this.started.delete(session.id);
+            this.onFinished?.({ sessionId: session.id });
+          }
+        }
+
         const turn = lastTurnOf(messages);
         if (!turn.idleId) continue;
         if (this.seen.has(turn.idleId)) continue;
@@ -999,6 +1079,13 @@ export class OpenCodeWatcher {
           this.touched.delete(session.id);
           this.report('warn', `could not report the opencode turn of ${session.id}: ${err.message}`);
         }
+      }
+      // A session that is gone cannot be running any more.
+      const present = new Set(sessions.map((session) => session.id));
+      for (const id of [...this.started.keys()]) {
+        if (present.has(id)) continue;
+        this.started.delete(id);
+        this.onFinished?.({ sessionId: id });
       }
       if (!this.seeded) {
         this.report('info', `opencode backlog recorded: ${sessions.length} session(s), ${inspected} inspected`);

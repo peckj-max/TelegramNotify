@@ -49,6 +49,7 @@ const BRIDGE_SETTING_KEYS = [
   'claudeOpenSession',
   'claudeAskWindowSeconds',
   'panelWaitSeconds',
+  'completionHoldSeconds',
 ];
 
 /** A double click delivers two command invocations; collapse them into one. */
@@ -509,7 +510,8 @@ async function startOpenCodeWatcher(notifier) {
         ? `waiting for the opencode server at ${endpoint.baseUrl} to answer`
         : 'waiting for the opencode server; its session watcher is running',
     );
-    return new opencode.OpenCodeWatcher({
+    let watcher = null;
+    const created = new opencode.OpenCodeWatcher({
       endpoint: () => opencode.discoverEndpoint(),
       // Every open folder: a multi-root workspace keeps its sessions under any of
       // them, and a single-folder window under its one folder.
@@ -523,7 +525,27 @@ async function startOpenCodeWatcher(notifier) {
         if (level === 'debug' && configured !== 'debug') return;
         log(`opencode: ${message}`);
       },
+      // A prompt typed into the OpenCode panel or its terminal belongs in the
+      // running prompts too, so /status shows it and /cancel can stop it.
+      onStarted: (turn) => {
+        const active = notifier.trackRunningPrompt({
+          agent: 'opencode',
+          prompt: turn.prompt,
+          sessionId: turn.sessionId,
+          startedAt: turn.startedAt,
+          interrupt: () => watcher?.interrupt(turn.sessionId),
+        });
+        log(`opencode turn started in ${turn.sessionId}; running prompt ${active.id}`);
+        if (bridge) refreshStatus();
+      },
+      onFinished: ({ sessionId }) => {
+        if (notifier.finishRunningPrompt(sessionId)) {
+          log(`opencode turn in ${sessionId} is no longer running`);
+          if (bridge) refreshStatus();
+        }
+      },
       onCompleted: async (turn) => {
+        if (notifier.finishRunningPrompt(turn.sessionId) && bridge) refreshStatus();
         if (!notifier.notificationsEnabled || notifier.config.notifyOnCompleted === false) {
           log(`opencode turn in ${turn.sessionId} finished but completion notifications are off`);
           return;
@@ -545,7 +567,9 @@ async function startOpenCodeWatcher(notifier) {
           log(`opencode completion could not be sent: ${result.reason || 'unknown reason'}`);
         }
       },
-    }).start();
+    });
+    watcher = created;
+    return created.start();
   } catch (err) {
     log(`could not watch opencode sessions: ${err.message}`);
     return null;
@@ -711,6 +735,7 @@ function openSettings() {
 
 async function showStatus() {
   const pending = bridge ? bridge.notifier.pending.list() : [];
+  const running = bridge ? [...bridge.notifier.activePrompts.values()] : [];
   const config = bridge ? bridge.notifier.config : null;
   const lines = [
     `${bridge ? `Bridge: running on ${config?.webhookPort} (${config?.webhookEnabled === false ? 'polling' : 'webhook'})` : 'Bridge: stopped'}`,
@@ -719,22 +744,32 @@ async function showStatus() {
     `Remote prompts: ${config?.remotePromptEnabled ? `on (VS Code Chat, last agent: ${bridge?.notifier?.lastAgent ?? 'copilot'})` : 'off'}`,
     `Agents: ${Object.entries(config?.agents ?? {}).map(([name, on]) => `${name}=${on ? 'on' : 'off'}`).join(' ')}`,
     `Pending: ${pending.length}`,
-    `Running prompts: ${bridge ? bridge.notifier.activePrompts?.size ?? 0 : 0}`,
+    `Running prompts: ${running.length} (${running.filter((item) => item.source !== 'telegram').length} from a panel or terminal)`,
     `Config: ${settingsFileLabel()}`,
   ].filter(Boolean);
+
+  // A prompt the panel or terminal started has no reply message here, so its id
+  // in the list is the only way to stop it: selecting it cancels that turn.
+  const runningItems = running.map((item) => ({
+    label: `${item.id} · ${item.agent || 'agent'} · running`,
+    description: `${item.source === 'telegram' ? 'prompt' : 'panel/terminal'} · ${Math.round((Date.now() - item.startedAt) / 1000)}s`,
+    detail: item.prompt ? String(item.prompt).split('\n')[0].slice(0, 120) : undefined,
+    id: item.id,
+  }));
 
   const choice = await vscode.window.showQuickPick(
     [
       ...lines.map((line) => ({ label: line, kind: vscode.QuickPickItemKind.Default })),
       { label: '', kind: vscode.QuickPickItemKind.Separator },
       ...pending.map((item) => ({ label: `${item.id} · ${item.agent} · ${item.type}`, description: `${item.expiresInSeconds}s left` })),
+      ...runningItems,
     ],
     { title: 'TelegramNotify', placeHolder: 'Bridge status' },
   );
-  if (choice && /^(?<id>[0-9a-f]{8}) ·/.test(choice.label)) {
-    const id = /^(?<id>[0-9a-f]{8}) ·/.exec(choice.label).groups.id;
-    bridge?.notifier.cancel(id);
-    log(`cancelled ${id}`);
+  const chosen = choice?.id ?? (/^(?<id>[0-9a-f]{8}) ·/.exec(choice?.label ?? '')?.groups.id ?? '');
+  if (chosen) {
+    bridge?.notifier.cancel(chosen);
+    log(`cancelled ${chosen}`);
   }
 }
 

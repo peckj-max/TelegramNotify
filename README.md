@@ -49,6 +49,14 @@ flowchart LR
   `session.execution.succeeded`, Claude Code `Stop` plus `SubagentStop`/
   `TaskCompleted`. Each completion is claimed atomically per turn (keyed on the
   transcript message id), so one finish produces one message.
+- **One message per task, not per turn.** The Copilot agent host stops a turn that
+  ended *without* calling `task_complete`, then nudges it to continue ("you have
+  not yet marked the task as complete") and the agent finishes 10–20 s later. That
+  interim stop is not sent: its notification is held for `completionHoldSeconds`
+  (default **15 s**), dropped when the host continues the session by itself, and
+  replaced if a newer turn of the same session finishes first. A real new prompt in
+  that window sends the held message instead of losing it. Holding happens in the
+  bridge, so the hook is answered at once and the agent's turn never waits.
 - **Two delivery modes.** Webhook mode registers a URL with Telegram and checks
   `X-Telegram-Bot-Api-Secret-Token` on every call; polling mode needs no public
   host at all. Either way only the configured chat ids are allowed to answer.
@@ -135,6 +143,7 @@ run for the bridge; VS Code hosts it.
 | `telegramNotify.claudeOpenSession` | `claudeOpenSession` | `true` |
 | `telegramNotify.claudeAskWindowSeconds` | `claudeAskWindowSeconds` | `20` |
 | `telegramNotify.panelWaitSeconds` | `panelWaitSeconds` | `20` |
+| `telegramNotify.completionHoldSeconds` | `completionHoldSeconds` | `15` |
 | `telegramNotify.logLevel` | — (editor only) | `info` |
 
 Commands: **Toggle Notifications** (status bar click), **Start/Stop/Restart
@@ -308,6 +317,7 @@ by the tests).
 | `claudeOpenSession` | Open the Claude Code session a Telegram prompt joins when it runs through Claude Code's own runtime (the fallback path), so the turn is part of the conversation on screen. | `true` |
 | `claudeAskWindowSeconds` | Seconds Claude Code's `AskUserQuestion` waits for an answer in Telegram before its own prompt takes over. `0` means only the panel or terminal asks. | `20` |
 | `panelWaitSeconds` | Seconds a Copilot `permission.requested` or `ask_user` prompt may stay unanswered in the panel before Telegram is told about it. Passive: nothing is decided from the chat. `0` turns the report off. | `20` |
+| `completionHoldSeconds` | Seconds a completion is held when its turn stopped without reporting a result (no `task_complete`). The agent host nudges such a turn to continue; the nudge drops the held message, a newer turn replaces it, and a real new prompt sends it first. `0` sends every completion at once. | `15` |
 
 The keys are grouped the same way the Settings UI shows them: notifications and
 agents first, then the webhook block.
@@ -329,6 +339,7 @@ container:
 | `TELEGRAM_NOTIFY_CLAUDE_OPEN_SESSION` | `claudeOpenSession` |
 | `TELEGRAM_NOTIFY_CLAUDE_ASK_WINDOW` | `claudeAskWindowSeconds` |
 | `TELEGRAM_NOTIFY_PANEL_WAIT` | `panelWaitSeconds` |
+| `TELEGRAM_NOTIFY_COMPLETION_HOLD` | `completionHoldSeconds` |
 | `TELEGRAM_NOTIFY_ASK_DIR` | folder for the ask markers that stop one request being asked twice (default `%TEMP%\telegram-notify`) |
 | `TELEGRAM_NOTIFY_COPILOT_HOME` | Copilot's state folder, read to learn whether a session is in autopilot or allow-all (default `~/.copilot`) |
 | `TELEGRAM_NOTIFY_NOTIFY_ON_START` | `notifyOnStart` |
@@ -355,7 +366,8 @@ work:
 - tap a button;
 - reply to the notification message with free text;
 - `/answer <id> <text>` (the id is shown by `/list`);
-- `/1`, `/2`, … for the newest request;
+- `/1` … `/8` for the newest request — each number picks that option of it, the
+  same as tapping the button with the same number. A plain `1` … `8` does the same;
 - `/cancel <id>` to stop waiting and let the agent continue.
 
 `/list` shows pending requests with the seconds left, `/status` shows the bridge
@@ -364,6 +376,24 @@ show what was sent and when, so the chat doubles as a log. Unanswered questions
 expire after `replyTimeoutSeconds` and the agent falls back to its normal prompt.
 With [remote prompts](#prompts-from-telegram) on, anything that is not a command
 or an answer is sent to the agent instead.
+
+### Running prompts
+
+Work in progress is listed whether or not Telegram started it:
+
+- a prompt sent from Telegram is tracked while its turn runs;
+- a prompt typed into the agent's **panel** (VS Code Chat, the Claude Code or
+  OpenCode sidebar) or its **terminal** is tracked from the event the agent reports
+  (Copilot and Claude hooks, the OpenCode session watcher). A prompt the agent host
+  writes for itself — the "keep going" nudge — is not a prompt, so it is not listed.
+
+`/list` and `/status` show them, and `/cancel <id>` (or `/cancel all`) stops one —
+for a prompt the bridge did not start, that is the agent's own stop/interrupt, so
+the turn ends in the panel exactly as if the stop button had been pressed. The
+entries disappear when the turn finishes.
+
+The id in `/list` (for example `3f9a2c1b`) is only a handle for that prompt, in the
+same shape as a pending request id: it encodes nothing and is not a queue position.
 
 **Permission prompts are reports, not questions.** When Copilot's panel or Claude
 Code asks for approval, Telegram receives a message with no buttons that says the
@@ -562,7 +592,7 @@ machine that never runs the extension.
 | --- | --- |
 | `PreToolUse` (`AskUserQuestion`) | Telegram asks first for `claudeAskWindowSeconds`. A Telegram answer returns as a `permissionDecision: "deny"` reason (free text too; several questions as `a | b`); no answer leaves the question to the interface that shows it. |
 | `Notification` | Reports the prompt Claude Code already shows. A permission notification ("Claude needs your permission to use …") is posted as a permission report with no buttons, so it is answered in the panel or terminal; anything else is posted as an attention message. |
-| `UserPromptSubmit` | Tells the bridge that Claude is the agent in use, so the next Telegram prompt goes to Claude. Silent unless `notifyOnStart` is on. |
+| `UserPromptSubmit` | Tells the bridge that Claude is the agent in use, so the next Telegram prompt goes to Claude, and records the prompt as a running prompt until `Stop`. Silent unless `notifyOnStart` is on. |
 | `Stop`, `SubagentStop`, `TaskCompleted` | Completion notification. The answer is read from the tail of the transcript: the `task_complete` summary when the host ended the turn with it, otherwise the closing block of assistant messages that do not come with a tool call. |
 
 No `PermissionRequest` hook is installed. It ran before Claude Code decided
@@ -620,7 +650,10 @@ passed as an argument because the VS Code agent host sends no event field on
 stdin; the hook still accepts Claude-style `hook_event_name` payloads.
 
 `userPromptSubmitted` is installed too: it is silent, and its only job is to tell
-the bridge that Copilot is the agent in use.
+the bridge that Copilot is the agent in use. When the host writes the prompt itself
+(the "you have not yet marked the task as complete" nudge it sends after a turn stops
+early), the event says so: that prompt is not a task, and it drops the notification
+the bridge was holding for the interrupted turn.
 
 Hosts that embed Copilot without a hook config can still reach the bridge: post
 the same payload to `POST /event/copilot` from the host's event handler.
@@ -639,6 +672,10 @@ the same server the desktop app and the OpenCode sidebar share, discovered from
   tool calls ("I'll check the project's state") is dropped, so a turn that was
   interrupted before it answered sends no text rather than its progress line. A
   turn whose provider failed is posted with its error message.
+- A user message with no `idle` after it is a turn that is running right now. That is
+  how a prompt typed into the OpenCode panel or its terminal becomes a **running
+  prompt**: `/list` and `/status` show it, and `/cancel` stops it through
+  `POST /api/session/<id>/interrupt`, exactly like the panel's stop button.
 - A poll compares both `time.updated` and `time.idle`: a finished turn leaves
   `updated` exactly where it was and only moves `idle`, so `updated` alone would
   hide every completion.

@@ -74,18 +74,23 @@ export function hasToolWorkOf(entry) {
 /**
  * Whether an entry is something the user typed, which starts a new turn.
  * Both schemas report it, and a tool result also arrives as a `user` entry in
- * Claude's format, so only real prompt text counts.
+ * Claude's format, so only real prompt text counts. A prompt the agent host writes
+ * for itself ("you have not yet marked the task as complete") is not the user
+ * either: the task is still the one running.
  *
  * @param {any} entry
  * @returns {boolean}
  */
 export function isUserEntry(entry) {
   const type = String(entry?.type ?? '');
-  if (type === 'user.message') return true;
+  if (type === 'user.message') {
+    const text = entry?.data?.content;
+    return typeof text === 'string' ? !isSystemPromptOf(text) : true;
+  }
   if (type !== 'user') return false;
 
   const content = entry?.message?.content ?? entry?.data?.content;
-  if (typeof content === 'string') return content.trim().length > 0;
+  if (typeof content === 'string') return !isSystemPromptOf(content) && content.trim().length > 0;
   if (!Array.isArray(content)) return false;
   // A tool result has no text part, only `tool_result` blocks.
   return content.some((part) => part?.type === 'text' && String(part.text ?? '').trim());
@@ -103,10 +108,10 @@ export function isUserEntry(entry) {
  *
  * @param {string|undefined|null} transcriptPath
  * @param {{ maxBytes?: number }} [options]
- * @returns {Promise<{ text: string, id: string }>}
+ * @returns {Promise<{ text: string, id: string, reported: boolean }>}
  */
 export async function readLastAssistantMessage(transcriptPath, options = {}) {
-  if (!transcriptPath) return { text: '', id: '' };
+  if (!transcriptPath) return { text: '', id: '', reported: false };
   const cap = options.maxBytes ?? MAX_READ_BYTES;
 
   let stat;
@@ -114,9 +119,9 @@ export async function readLastAssistantMessage(transcriptPath, options = {}) {
     stat = await fs.promises.stat(transcriptPath);
   } catch (err) {
     log.debug(`could not stat transcript: ${err.message}`);
-    return { text: '', id: '' };
+    return { text: '', id: '', reported: false };
   }
-  if (!stat.isFile() || stat.size === 0) return { text: '', id: '' };
+  if (!stat.isFile() || stat.size === 0) return { text: '', id: '', reported: false };
 
   let handle;
   try {
@@ -156,7 +161,7 @@ export async function readLastAssistantMessage(transcriptPath, options = {}) {
   } finally {
     await handle?.close();
   }
-  return { text: '', id: '' };
+  return { text: '', id: '', reported: false };
 }
 
 /**
@@ -171,6 +176,52 @@ export function isAssistantEntry(entry) {
   const type = String(entry?.type ?? '');
   if (type === 'assistant' || type === 'assistant.message') return true;
   return entry?.message?.role === 'assistant' || entry?.data?.role === 'assistant';
+}
+
+/**
+ * Prompts an agent host injects by itself: the "keep going" nudge it sends when a
+ * turn stopped before calling `task_complete`. They arrive as user messages and as
+ * `UserPromptSubmit` hooks, so without this they look like the user asking again.
+ */
+const SYSTEM_PROMPT_PATTERNS = [
+  /you have not yet marked the task as complete/i,
+  /stop planning and start implementing/i,
+  /you aren't done until you have fully completed the task/i,
+  /keep working autonomously until the task is truly finished/i,
+];
+
+/**
+ * Whether a prompt was written by the agent host rather than by the user.
+ *
+ * @param {string} prompt
+ * @returns {boolean}
+ */
+export function isSystemPromptOf(prompt) {
+  const text = String(prompt ?? '');
+  if (!text.trim()) return false;
+  return SYSTEM_PROMPT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/**
+ * Whether the turn ended by reporting its result through `task_complete`.
+ *
+ * The agent host nudges a turn that ends without it ("you have not yet marked the
+ * task as complete"), so such a turn is not the end of the work even though the
+ * host stopped it. The bridge holds that notification briefly instead of posting an
+ * interim answer.
+ *
+ * @param {any[]} entries
+ * @returns {boolean}
+ */
+export function reportedTaskComplete(entries) {
+  if (!Array.isArray(entries)) return false;
+  for (const entry of entries) {
+    if (String(entry?.type ?? '') === 'session.task_complete') return true;
+    if (!isAssistantEntry(entry)) continue;
+    const requests = [entry?.data?.toolRequests, entry?.toolRequests].filter(Array.isArray).flat();
+    if (requests.some((request) => /task[_-]?complete/i.test(String(request?.name ?? '')))) return true;
+  }
+  return false;
 }
 
 /**
@@ -214,11 +265,15 @@ export function taskSummaryOf(entries) {
  * cumulative snapshot of one message is collapsed so the same sentence is not
  * posted twice.
  *
+ * `reported` says whether the turn ended by reporting its result through
+ * `task_complete`; without it the agent host treats the turn as unfinished and
+ * nudges it to continue.
+ *
  * @param {any[]} entries
- * @returns {{ text: string, id: string }}
+ * @returns {{ text: string, id: string, reported: boolean }}
  */
 export function turnOf(entries) {
-  if (!Array.isArray(entries) || !entries.length) return { text: '', id: '' };
+  if (!Array.isArray(entries) || !entries.length) return { text: '', id: '', reported: false };
 
   let start = 0;
   for (let index = entries.length - 1; index >= 0; index -= 1) {
@@ -253,7 +308,7 @@ export function turnOf(entries) {
   // conclusion is.
   const capped = text.length > MAX_TEXT ? `…\n\n${text.slice(text.length - MAX_TEXT)}` : text;
 
-  return { text: capped.trim(), id };
+  return { text: capped.trim(), id, reported: reportedTaskComplete(turn) };
 }
 
 /**

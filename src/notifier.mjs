@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { formatAgentMessages, formatDuration, formatResolution, truncate } from './message.mjs';
 import { fitsOneMessage } from './markdown.mjs';
 import { PendingRequests } from './pending.mjs';
@@ -17,6 +18,13 @@ const MAX_SEEN_UPDATES = 500;
 const USER_CANCELLED_TEXT = 'Task is cancelled by user.';
 /** Agent for a Telegram prompt before any agent has reported an event. */
 const DEFAULT_AGENT = 'copilot';
+/**
+ * How long a turn that stopped without reporting its result is held, unless the config
+ * says otherwise. The agent host nudges such a turn within seconds ("you have not yet
+ * marked the task as complete"); a nudge drops the held message, a real new task sends
+ * it first.
+ */
+const COMPLETION_HOLD_MS = 15000;
 /** What OpenCode accepts for a permission, in the order the buttons are drawn. */
 const OPENCODE_PERMISSION_OPTIONS = ['Allow once', 'Always allow', 'Deny'];
 /**
@@ -43,6 +51,17 @@ function normalizeOptions(value) {
     .map((option) => String(option).trim())
     .filter(Boolean)
     .slice(0, 8);
+}
+
+/**
+ * A short id for a running prompt, in the same shape as a pending request id, so
+ * `/list` shows one kind of id and `/cancel` accepts either. The id is only a
+ * handle: it carries no meaning and is not a queue position.
+ *
+ * @returns {string}
+ */
+function newPromptId() {
+  return randomUUID().replace(/-/g, '').slice(0, 8);
 }
 
 /**
@@ -91,6 +110,15 @@ export class Notifier {
     // progress until their timeout.
     this.activePrompts = new Map();
     this.promptSeq = 0;
+    /**
+     * Completions waiting out {@link completionHoldMs}, by session id. A turn that
+     * stops without reporting its result is held, so an agent host that continues it
+     * on its own cannot make Telegram show an interim answer it will replace.
+     */
+    this.held = new Map();
+    this.completionHoldMs = Number.isFinite(Number(deps.completionHoldMs))
+      ? Math.max(0, Number(deps.completionHoldMs))
+      : Math.max(0, Number(config?.completionHoldSeconds ?? 15)) * 1000;
     // Telegram redelivers an update until it is acknowledged; a redelivered
     // prompt must not start a second session.
     this.seenUpdates = new Map();
@@ -106,6 +134,86 @@ export class Notifier {
   /** Notifications are switched off: send nothing, and answer nothing. */
   get notificationsEnabled() {
     return this.config.notificationsEnabled !== false;
+  }
+
+  /**
+   * Holds a completion that may only be the interim end of a task, and sends it when
+   * nothing continues the session before the hold ends.
+   *
+   * A newer completion of the same session replaces a held one — the last turn is
+   * the answer — and a prompt the agent host writes for itself drops it.
+   *
+   * @param {object} request a validated `completed` request
+   * @returns {Promise<{ ok: boolean, skipped?: boolean, reason?: string }>} settles when the hold does
+   */
+  #holdCompletion(request) {
+    const sessionId = String(request.sessionId || '');
+    const key = sessionId || `anonymous:${request.agent || ''}:${request.title || ''}`;
+    const windowMs = Math.max(0, Number(this.completionHoldMs) || 0);
+    if (!windowMs) return this.notify({ ...request, interim: false });
+
+    this.#supersedeCompletion(sessionId);
+
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.held.delete(key);
+        log.debug(`sending the held completion of ${sessionId || 'the session'}`);
+        this.notify({ ...request, interim: false }).then(resolve, (err) =>
+          resolve({ ok: false, reason: 'hold-failed', error: err.message }),
+        );
+      }, windowMs);
+      timer.unref?.();
+      this.held.set(key, { sessionId, request, timer, resolve });
+    });
+  }
+
+  /**
+   * Sends a held completion now, because a new task has started: it belongs to the
+   * work before that task, and dropping it would lose the result.
+   *
+   * @param {string} [sessionId]
+   */
+  async #flushCompletion(sessionId) {
+    const entry = this.held.get(String(sessionId || ''));
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    this.held.delete(String(sessionId || ''));
+    log.debug(`a new task started in ${sessionId}; sending its held completion first`);
+    const result = await this.notify({ ...entry.request, interim: false });
+    entry.resolve(result);
+  }
+
+  /**
+   * Drops a held completion: the agent host continued the turn on its own, so that
+   * text was not the answer.
+   *
+   * @param {string} [sessionId]
+   * @returns {boolean} whether something was held
+   */
+  #dropCompletion(sessionId) {
+    const key = String(sessionId || '');
+    const entry = this.held.get(key);
+    if (!entry) return false;
+    clearTimeout(entry.timer);
+    this.held.delete(key);
+    entry.resolve({ ok: true, skipped: true, reason: 'interim-dropped' });
+    return true;
+  }
+
+  /**
+   * Drops a held completion because a newer turn of the same session arrived.
+   *
+   * @param {string} [sessionId]
+   * @returns {boolean} whether something was held
+   */
+  #supersedeCompletion(sessionId) {
+    const key = String(sessionId || '');
+    const entry = this.held.get(key);
+    if (!entry) return false;
+    clearTimeout(entry.timer);
+    this.held.delete(key);
+    entry.resolve({ ok: true, skipped: true, reason: 'superseded' });
+    return true;
   }
 
   /** @param {string|number} chatId */
@@ -148,11 +256,43 @@ export class Notifier {
   async notify(request = {}) {
     const type = normalizeType(request.type);
     this.#rememberAgent(request.agent);
+
+    // A prompt the agent host writes for itself ("you have not yet marked the task
+    // as complete") is not the user asking again: it is the same task continuing, so
+    // nothing is listed for it and the notification held for the turn it interrupted
+    // is dropped.
+    if (request.promptStart === true && request.synthetic === true) {
+      const dropped = this.#dropCompletion(request.sessionId);
+      log.debug(`the agent continued ${request.sessionId || 'the session'} on its own; ${dropped ? 'the held completion was dropped' : 'nothing was held'}`);
+      return { ok: true, skipped: true, reason: 'synthetic-prompt' };
+    }
+
+    // A prompt an agent received from its own panel or terminal is still work in
+    // progress, so it is listed with the prompts the bridge runs. A completion that
+    // was waiting to be sent belongs to the task before it, so it goes out now.
+    if (request.promptStart === true) {
+      await this.#flushCompletion(request.sessionId);
+      this.trackRunningPrompt({
+        agent: String(request.agent || ''),
+        prompt: String(request.message || request.prompt || ''),
+        sessionId: request.sessionId,
+        startedAt: request.startedAt,
+      });
+    }
+
     // The turn is over: stop watching any prompt this completion belongs to, so
     // its typing hint ends and the answer is not posted twice. Done before the
     // early returns below: a completion never waits for a reply, and the prompt
     // must end even when this notification is skipped.
-    if (type === 'completed') this.#finishPromptsAnsweredByHook(String(request.agent || ''));
+    if (type === 'completed') {
+      this.#finishPromptsAnsweredByHook(String(request.agent || ''));
+      this.finishRunningPrompt(request.sessionId);
+      // A newer turn of the same session makes a held predecessor stale: the last
+      // turn is the answer, so only one message is sent for the whole task.
+      if (request.interim !== true && this.#supersedeCompletion(request.sessionId)) {
+        log.debug(`a newer turn of ${request.sessionId || 'the session'} replaced the held completion`);
+      }
+    }
     if (request.silent === true) {
       // A hook using the bridge only to say which agent is in use: nothing to send.
       log.debug(`silent ${request.agent || 'agent'} event recorded`);
@@ -173,6 +313,18 @@ export class Notifier {
     const chatId = String(request.chatId || this.config.chatIds[0]);
     if (!this.acceptsChat(chatId)) {
       return { ok: false, skipped: true, reason: 'chat-not-allowed' };
+    }
+
+    // A turn that stopped without reporting its result is often a turn the agent
+    // host is about to pick up again on its own. Holding it briefly is what lets a
+    // nudge ("you have not yet marked the task as complete") drop the interim
+    // message instead of sending an answer that is immediately overtaken.
+    //
+    // The hold runs in the background: the hook that posted this event must not be
+    // made to wait for it, or the agent's turn would stall for the whole window.
+    if (type === 'completed' && request.interim === true && this.completionHoldMs > 0) {
+      void this.#holdCompletion({ ...request, type, chatId });
+      return { ok: true, deferred: true, reason: 'held', holdSeconds: Math.round(this.completionHoldMs / 1000) };
     }
 
     const waitForReply = Boolean(request.waitForReply);
@@ -310,6 +462,13 @@ export class Notifier {
     for (const active of this.activePrompts.values()) {
       if (this.#cancelPrompt(active)) activeCount += 1;
     }
+    // A held completion belongs to the task being cancelled: sending it afterwards
+    // would report work the user just stopped.
+    for (const [key, entry] of [...this.held]) {
+      clearTimeout(entry.timer);
+      this.held.delete(key);
+      entry.resolve({ ok: true, skipped: true, reason: 'cancelled' });
+    }
     return pendingCount + activeCount;
   }
 
@@ -322,6 +481,10 @@ export class Notifier {
       agent,
       prompt,
       chatId,
+      // A prompt the bridge runs itself, as opposed to one an agent is running in
+      // its own panel or terminal.
+      source: 'telegram',
+      sessionId: '',
       startedAt: Date.now(),
       cancelled: false,
       // Set when the agent hooks report the turn ended, so the bridge stops
@@ -334,7 +497,105 @@ export class Notifier {
     return active;
   }
 
-  /** @param {{ cancelled: boolean, controller: AbortController, stopTyping: () => void }} active */
+  /**
+   * Records a prompt an agent is running although the bridge did not start it — a
+   * turn typed into the editor panel or the agent's terminal. `/list` and
+   * `/status` show it, and `/cancel` stops it through `interrupt`.
+   *
+   * The session identifies the turn, so polling the same running turn again
+   * refreshes the entry instead of adding a second one.
+   *
+   * @param {object} input
+   * @param {string} [input.agent]
+   * @param {string} [input.prompt]
+   * @param {'external'} [input.source]
+   * @param {string} [input.sessionId]
+   * @param {number} [input.startedAt]
+   * @param {() => Promise<boolean>|boolean} [input.interrupt]
+   */
+  trackRunningPrompt({ agent, prompt, source = 'external', sessionId, startedAt, interrupt } = {}) {
+    const session = String(sessionId || '').trim();
+    const key = session ? `session:${session}` : '';
+    if (key) {
+      for (const active of this.activePrompts.values()) {
+        if (active.key !== key) continue;
+        if (prompt) active.prompt = String(prompt);
+        return active;
+      }
+    }
+
+    // The bridge may have submitted this very prompt through the editor, and the
+    // agent's hook then reports the same turn. What the bridge runs is already
+    // listed, so a second entry would only show one prompt twice.
+    const twin = this.#telegramPromptFor(prompt);
+    if (twin) {
+      if (session) twin.sessionId = twin.sessionId || session;
+      return twin;
+    }
+
+    this.promptSeq += 1;
+    const id = newPromptId();
+    const started = Number(startedAt);
+    const active = {
+      id,
+      key,
+      agent: String(agent || ''),
+      prompt: String(prompt || ''),
+      chatId: null,
+      source,
+      sessionId: session,
+      startedAt: Number.isFinite(started) && started > 0 ? started : Date.now(),
+      cancelled: false,
+      hookAnswered: false,
+      stopTyping: () => {},
+      controller: new AbortController(),
+      interrupt: typeof interrupt === 'function' ? interrupt : null,
+    };
+    this.activePrompts.set(id, active);
+    log.debug(`tracking running prompt ${id} (${active.agent || 'agent'}, ${session || 'no session'})`);
+    return active;
+  }
+
+  /**
+   * Forgets the running prompt of a session that finished.
+   *
+   * @param {string} sessionId
+   * @returns {boolean} whether an entry was removed
+   */
+  finishRunningPrompt(sessionId) {
+    const session = String(sessionId || '').trim();
+    if (!session) return false;
+    const key = `session:${session}`;
+    for (const [id, active] of this.activePrompts) {
+      if (active.key !== key) continue;
+      active.stopTyping?.();
+      this.activePrompts.delete(id);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * The prompt the bridge itself is running, when it matches this text. Only a
+   * recent one counts: an old prompt that happened to say the same thing is a
+   * different task.
+   *
+   * @param {string} [prompt]
+   * @returns {object|null}
+   */
+  #telegramPromptFor(prompt) {
+    const normalize = (value) => String(value ?? '').replace(/\r\n/g, '\n').trim();
+    const wanted = normalize(prompt);
+    if (!wanted) return null;
+    for (const active of this.activePrompts.values()) {
+      if (active.source !== 'telegram') continue;
+      if (Date.now() - active.startedAt > 60000) continue;
+      if (normalize(active.prompt) === wanted) return active;
+    }
+    return null;
+  }
+
+  /** @param {{ cancelled: boolean, controller: AbortController, stopTyping: () => void, interrupt?: (() => Promise<boolean>|boolean)|null, source?: string, id: string }} active */
   #cancelPrompt(active) {
     if (active.cancelled) return false;
     active.cancelled = true;
@@ -344,6 +605,21 @@ export class Notifier {
     } catch {
       /* already aborted */
     }
+    // A prompt the bridge did not start belongs to another runtime: stop it there.
+    if (active.interrupt) {
+      try {
+        Promise.resolve(active.interrupt())
+          .then((stopped) => {
+            if (!stopped) log.warn(`could not stop the ${active.agent || 'agent'} turn of ${active.sessionId || active.id}`);
+          })
+          .catch((err) => log.warn(`could not stop the ${active.agent || 'agent'} turn: ${err.message}`));
+      } catch (err) {
+        log.warn(`could not stop the ${active.agent || 'agent'} turn: ${err.message}`);
+      }
+    }
+    // Its runtime will report the turn ending; keeping the entry would leave
+    // /status listing a prompt that was just stopped.
+    if (active.source !== 'telegram') this.activePrompts.delete(active.id);
     return true;
   }
 
@@ -520,8 +796,27 @@ export class Notifier {
       }
       case 'answer':
         return await this.answerCommand(command.arg);
-      case 'option':
-        return await this.answerOption(command.arg, command.text);
+      case 'option': {
+        // `/1` … `/8` pick an option of the newest request, like tapping its
+        // button. The number is an option index, not a request id.
+        const newest = this.pending.list().at(-1);
+        if (!newest) {
+          await this.sendText('Nothing is waiting for an answer. Use /list to see running work.');
+          return { handled: true, command: 'option', ok: false };
+        }
+        const picked = Number(command.arg) - 1;
+        if (!(picked >= 0 && picked < newest.options.length)) {
+          await this.sendText(
+            newest.options.length
+              ? `That request has ${newest.options.length} option(s): ${newest.options
+                  .map((option, index) => `${index + 1}. ${escapeText(truncate(option, 40))}`)
+                  .join(' · ')}`
+              : 'That request takes a free-text reply, so it has no numbered options.',
+          );
+          return { handled: true, command: 'option', ok: false };
+        }
+        return await this.answerOption(newest.id, command.arg);
+      }
       default:
         break;
     }
@@ -554,6 +849,9 @@ export class Notifier {
     const normalize = (value) => String(value ?? '').replace(/\r\n/g, '\n').trim();
     const wanted = normalize(prompt);
     for (const active of this.activePrompts.values()) {
+      // A turn running in a panel or terminal is the user's own; it must not make
+      // the same text sent from Telegram look like a redelivery.
+      if (active.source !== 'telegram') continue;
       if (String(active.chatId) !== String(chatId)) continue;
       if (normalize(active.prompt) === wanted) return active;
     }
@@ -576,7 +874,7 @@ export class Notifier {
   async runRemotePrompt(prompt, chatId) {
     const agent = this.lastAgent;
     this.promptSeq += 1;
-    const id = `p${Date.now().toString(36)}${this.promptSeq.toString(36)}`;
+    const id = newPromptId();
     const active = this.#trackPrompt({ id, agent, prompt, chatId });
     log.info(`remote prompt ${id} → ${agent} (${prompt.length} chars)`);
 
@@ -1063,12 +1361,14 @@ export class Notifier {
           item.title ? escapeText(truncate(item.title, 60)) : '—'
         } · ${item.expiresInSeconds}s left`,
     );
-    const runningLines = running.map(
-      (item) =>
-        `<code>${item.id}</code> ${escapeText(item.agent || 'agent')} · prompt · ${escapeText(
-          truncate(item.prompt, 60),
-        )} · ${Math.round((Date.now() - item.startedAt) / 1000)}s`,
-    );
+    const runningLines = running.map((item) => {
+      // Say where the prompt came from: one the panel or terminal started cannot be
+      // resumed from here, but it is work in progress all the same.
+      const origin = item.source === 'telegram' ? 'prompt' : item.source === 'external' ? 'panel/terminal' : 'prompt';
+      return `<code>${item.id}</code> ${escapeText(item.agent || 'agent')} · ${origin} · ${escapeText(
+        truncate(item.prompt || '—', 60),
+      )} · ${Math.round((Date.now() - item.startedAt) / 1000)}s`;
+    });
     await this.sendText(
       [
         ...(lines.length ? ['<b>Waiting for an answer</b>', ...lines] : []),

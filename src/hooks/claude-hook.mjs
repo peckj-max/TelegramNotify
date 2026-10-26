@@ -172,6 +172,10 @@ async function handlePromptSubmitted(input, config) {
     title: 'Claude Code received a prompt',
     message: shorten(prompt, 600),
     cwd: input.cwd || '',
+    // A prompt started in the Claude panel or terminal is work in progress: the
+    // bridge lists it with the prompts it runs itself, and clears it on the stop.
+    promptStart: true,
+    sessionId: input.session_id || input.sessionId || '',
     ...(config.notifyOnStart ? {} : { silent: true }),
   });
   return finish(null);
@@ -221,6 +225,8 @@ async function handleCompleted(eventName, input) {
     message: found.text || undefined,
     detail: eventName === 'StopFailure' ? shorten(input.error || input.reason || '', 4000) : '',
     cwd: input.cwd || '',
+    // Ends the running prompt this turn belonged to.
+    sessionId,
   });
   return finish(null);
 }

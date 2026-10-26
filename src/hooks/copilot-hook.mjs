@@ -15,7 +15,7 @@ import { createHash } from 'node:crypto';
 import { loadConfigForHooks } from '../config.mjs';
 import { log } from '../logger.mjs';
 import { finish, postEvent, readHookInput, shorten } from './adapter-utils.mjs';
-import { findTranscript, readLastAssistantMessage } from './transcript.mjs';
+import { findTranscript, isSystemPromptOf, readLastAssistantMessage } from './transcript.mjs';
 
 const COMPLETED_EVENTS = new Set(['sessionend', 'agentstop', 'taskcomplete', 'stop', 'complete', 'finished']);
 
@@ -39,15 +39,25 @@ async function main() {
     case 'erroroccurred':
       return await handleError(input);
     case 'userpromptsubmitted': {
+      const prompt = promptOf(input);
+      // The agent host writes its own "keep going" prompt when a turn stopped early.
+      // It is not the user asking anything, so it is not listed as a task; the bridge
+      // uses it to drop the completion it was holding for the interrupted turn.
+      const synthetic = isSystemPromptOf(prompt);
       // Always report it: the bridge records which agent is in use, so the next
       // Telegram prompt goes there. Only `notifyOnStart` makes it a message.
       await postEvent('copilot', {
         agent: 'copilot',
         type: 'info',
-        title: 'Copilot received a prompt',
-        message: shorten(promptOf(input), 600),
+        title: synthetic ? 'Copilot continued the task on its own' : 'Copilot received a prompt',
+        message: shorten(prompt, 600),
         cwd: cwdOf(input),
-        ...(config.notifyOnStart ? {} : { silent: true }),
+        // A prompt started in the Chat panel is work in progress: the bridge lists
+        // it with the prompts it runs itself, and clears it when the turn ends.
+        promptStart: true,
+        ...(synthetic ? { synthetic: true } : {}),
+        sessionId: sessionIdOf(input),
+        ...(config.notifyOnStart && !synthetic ? {} : { silent: true }),
       });
       return finish(null);
     }
@@ -76,6 +86,10 @@ function inferredEvent(input) {
 
 function cwdOf(input) {
   return input.cwd || input.workingDirectory || input.working_directory || '';
+}
+
+function sessionIdOf(input) {
+  return input.sessionId || input.session_id || input.sessionID || '';
 }
 
 function promptOf(input) {
@@ -128,6 +142,12 @@ async function handleCompleted(eventName, input) {
         ? ''
         : `stop reason: ${input.stopReason || input.stop_reason}\nsession: ${sessionId || 'unknown'}`,
     cwd: cwdOf(input),
+    // Ends the running prompt this turn belonged to.
+    sessionId,
+    // A turn that stopped without reporting its result may be continued by the host
+    // on its own; the bridge holds it instead of sending an answer that will be
+    // overtaken seconds later.
+    ...(found.reported === false ? { interim: true } : {}),
   });
   return finish(null);
 }
