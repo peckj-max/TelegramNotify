@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { formatAgentMessages, formatDuration, formatResolution, truncate } from './message.mjs';
 import { fitsOneMessage } from './markdown.mjs';
 import { PendingRequests } from './pending.mjs';
-import { AGENTS } from './config.mjs';
+import { AGENTS, PROMPT_AGENTS } from './config.mjs';
 import { runClaudePrompt, runOpenCodePrompt } from './remote-prompt.mjs';
 import { askReplyPrompt } from './hooks/ask.mjs';
 import { TelegramClient } from './telegram.mjs';
@@ -18,13 +18,6 @@ const MAX_SEEN_UPDATES = 500;
 const USER_CANCELLED_TEXT = 'Task is cancelled by user.';
 /** Agent for a Telegram prompt before any agent has reported an event. */
 const DEFAULT_AGENT = 'copilot';
-/**
- * How long a turn that stopped without reporting its result is held, unless the config
- * says otherwise. The agent host nudges such a turn within seconds ("you have not yet
- * marked the task as complete"); a nudge drops the held message, a real new task sends
- * it first.
- */
-const COMPLETION_HOLD_MS = 15000;
 /** What OpenCode accepts for a permission, in the order the buttons are drawn. */
 const OPENCODE_PERMISSION_OPTIONS = ['Allow once', 'Always allow', 'Deny'];
 /**
@@ -103,7 +96,7 @@ export class Notifier {
     // A Telegram prompt goes to the agent that was used last; Copilot until some
     // agent reports an event.
     this.rememberAgent = deps.rememberAgent ?? null;
-    this.lastAgent = AGENTS.includes(String(deps.initialAgent || '').toLowerCase())
+    this.lastAgent = PROMPT_AGENTS.includes(String(deps.initialAgent || '').toLowerCase())
       ? String(deps.initialAgent).toLowerCase()
       : DEFAULT_AGENT;
     // Prompts still running, so they can be stopped instead of reporting
@@ -111,14 +104,11 @@ export class Notifier {
     this.activePrompts = new Map();
     this.promptSeq = 0;
     /**
-     * Completions waiting out {@link completionHoldMs}, by session id. A turn that
-     * stops without reporting its result is held, so an agent host that continues it
-     * on its own cannot make Telegram show an interim answer it will replace.
+     * session id → the agent that session really is (`local` when it runs on a
+     * locally configured model). The Copilot hooks cannot see the model, so they always
+     * report `copilot`; this map corrects the name for the session they belong to.
      */
-    this.held = new Map();
-    this.completionHoldMs = Number.isFinite(Number(deps.completionHoldMs))
-      ? Math.max(0, Number(deps.completionHoldMs))
-      : Math.max(0, Number(config?.completionHoldSeconds ?? 15)) * 1000;
+    this.sessionAgents = new Map();
     // Telegram redelivers an update until it is acknowledged; a redelivered
     // prompt must not start a second session.
     this.seenUpdates = new Map();
@@ -137,83 +127,46 @@ export class Notifier {
   }
 
   /**
-   * Holds a completion that may only be the interim end of a task, and sends it when
-   * nothing continues the session before the hold ends.
+   * Records which agent a session really is, when that has been learned from an event
+   * whose source is unambiguous — a harness that reported as `local`. A Copilot hook
+   * cannot tell Copilot from a local harness, so it never sets this; once a session is
+   * known to be local, its later `copilot`-looking events are labelled `local` too, which
+   * is what a harness that only identifies itself for the first turn needs.
    *
-   * A newer completion of the same session replaces a held one — the last turn is
-   * the answer — and a prompt the agent host writes for itself drops it.
-   *
-   * @param {object} request a validated `completed` request
-   * @returns {Promise<{ ok: boolean, skipped?: boolean, reason?: string }>} settles when the hold does
+   * @param {string} sessionId
+   * @param {string} agent
    */
-  #holdCompletion(request) {
-    const sessionId = String(request.sessionId || '');
-    const key = sessionId || `anonymous:${request.agent || ''}:${request.title || ''}`;
-    const windowMs = Math.max(0, Number(this.completionHoldMs) || 0);
-    if (!windowMs) return this.notify({ ...request, interim: false });
-
-    this.#supersedeCompletion(sessionId);
-
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        this.held.delete(key);
-        log.debug(`sending the held completion of ${sessionId || 'the session'}`);
-        this.notify({ ...request, interim: false }).then(resolve, (err) =>
-          resolve({ ok: false, reason: 'hold-failed', error: err.message }),
-        );
-      }, windowMs);
-      timer.unref?.();
-      this.held.set(key, { sessionId, request, timer, resolve });
-    });
+  assignSessionAgent(sessionId, agent) {
+    const id = String(sessionId || '').trim();
+    const name = String(agent || '').trim().toLowerCase();
+    if (!id || !AGENTS.includes(name)) return;
+    // The session in use is where the next Telegram prompt belongs.
+    this.#rememberAgent(name);
+    const known = this.sessionAgents.get(id);
+    if (known === name) return;
+    this.sessionAgents.set(id, name);
+    // The map only exists to correct what the hooks report; keep it small.
+    while (this.sessionAgents.size > 200) {
+      this.sessionAgents.delete(this.sessionAgents.keys().next().value);
+    }
+    log.debug(`session ${id} is ${name}`);
   }
 
   /**
-   * Sends a held completion now, because a new task has started: it belongs to the
-   * work before that task, and dropping it would lose the result.
+   * The agent a request belongs to: what the session was already known to be, else what
+   * the event says. A session is Copilot until something explicitly reported otherwise,
+   * because a Copilot hook cannot see which harness ran it.
    *
-   * @param {string} [sessionId]
+   * @param {{ agent?: string, sessionId?: string }} request
+   * @returns {string}
    */
-  async #flushCompletion(sessionId) {
-    const entry = this.held.get(String(sessionId || ''));
-    if (!entry) return;
-    clearTimeout(entry.timer);
-    this.held.delete(String(sessionId || ''));
-    log.debug(`a new task started in ${sessionId}; sending its held completion first`);
-    const result = await this.notify({ ...entry.request, interim: false });
-    entry.resolve(result);
-  }
-
-  /**
-   * Drops a held completion: the agent host continued the turn on its own, so that
-   * text was not the answer.
-   *
-   * @param {string} [sessionId]
-   * @returns {boolean} whether something was held
-   */
-  #dropCompletion(sessionId) {
-    const key = String(sessionId || '');
-    const entry = this.held.get(key);
-    if (!entry) return false;
-    clearTimeout(entry.timer);
-    this.held.delete(key);
-    entry.resolve({ ok: true, skipped: true, reason: 'interim-dropped' });
-    return true;
-  }
-
-  /**
-   * Drops a held completion because a newer turn of the same session arrived.
-   *
-   * @param {string} [sessionId]
-   * @returns {boolean} whether something was held
-   */
-  #supersedeCompletion(sessionId) {
-    const key = String(sessionId || '');
-    const entry = this.held.get(key);
-    if (!entry) return false;
-    clearTimeout(entry.timer);
-    this.held.delete(key);
-    entry.resolve({ ok: true, skipped: true, reason: 'superseded' });
-    return true;
+  #resolveAgent(request) {
+    const reported = String(request.agent || '').trim().toLowerCase();
+    // OpenCode and Claude events name themselves; only the harness that cannot see which
+    // one ran it (Copilot's) is resolved from what the session was reported to be.
+    if (reported && reported !== 'copilot' && reported !== 'local') return reported;
+    const known = this.sessionAgents.get(String(request.sessionId || '').trim());
+    return known || reported;
   }
 
   /** @param {string|number} chatId */
@@ -223,14 +176,15 @@ export class Notifier {
 
   /**
    * Remembers which agent is in use, so the next Telegram prompt is delivered to
-   * it rather than to a configured one. Calls that are not real agents — the
-   * extension's own test message reports `vscode` — are ignored.
+   * it rather than to a configured one. Calls that are not real prompt targets — the
+   * extension's own test message reports `vscode`, and a local harness has no session
+   * the bridge can drive — are ignored.
    *
    * @param {unknown} value
    */
   #rememberAgent(value) {
     const agent = String(value ?? '').trim().toLowerCase();
-    if (!AGENTS.includes(agent) || agent === this.lastAgent) return;
+    if (!PROMPT_AGENTS.includes(agent) || agent === this.lastAgent) return;
     this.lastAgent = agent;
     log.debug(`last agent is now ${agent}`);
     try {
@@ -255,23 +209,26 @@ export class Notifier {
    */
   async notify(request = {}) {
     const type = normalizeType(request.type);
+    // The event's own agent is what the harness reported; a session already known to be
+    // local keeps that name. The title is built from the same name, so a message can never
+    // say "Copilot finished" above `local`.
+    const reported = String(request.agent || '').trim().toLowerCase();
+    if (reported === 'local' && request.sessionId) this.assignSessionAgent(request.sessionId, 'local');
+    const agent = this.#resolveAgent(request) || reported;
+    request = { ...request, agent, title: titleForAgent(request.title, agent, type) };
     this.#rememberAgent(request.agent);
 
     // A prompt the agent host writes for itself ("you have not yet marked the task
     // as complete") is not the user asking again: it is the same task continuing, so
-    // nothing is listed for it and the notification held for the turn it interrupted
-    // is dropped.
+    // nothing is listed for it.
     if (request.promptStart === true && request.synthetic === true) {
-      const dropped = this.#dropCompletion(request.sessionId);
-      log.debug(`the agent continued ${request.sessionId || 'the session'} on its own; ${dropped ? 'the held completion was dropped' : 'nothing was held'}`);
+      log.debug(`the agent continued ${request.sessionId || 'the session'} on its own`);
       return { ok: true, skipped: true, reason: 'synthetic-prompt' };
     }
 
     // A prompt an agent received from its own panel or terminal is still work in
-    // progress, so it is listed with the prompts the bridge runs. A completion that
-    // was waiting to be sent belongs to the task before it, so it goes out now.
+    // progress, so it is listed with the prompts the bridge runs.
     if (request.promptStart === true) {
-      await this.#flushCompletion(request.sessionId);
       this.trackRunningPrompt({
         agent: String(request.agent || ''),
         prompt: String(request.message || request.prompt || ''),
@@ -287,11 +244,6 @@ export class Notifier {
     if (type === 'completed') {
       this.#finishPromptsAnsweredByHook(String(request.agent || ''));
       this.finishRunningPrompt(request.sessionId);
-      // A newer turn of the same session makes a held predecessor stale: the last
-      // turn is the answer, so only one message is sent for the whole task.
-      if (request.interim !== true && this.#supersedeCompletion(request.sessionId)) {
-        log.debug(`a newer turn of ${request.sessionId || 'the session'} replaced the held completion`);
-      }
     }
     if (request.silent === true) {
       // A hook using the bridge only to say which agent is in use: nothing to send.
@@ -315,17 +267,9 @@ export class Notifier {
       return { ok: false, skipped: true, reason: 'chat-not-allowed' };
     }
 
-    // A turn that stopped without reporting its result is often a turn the agent
-    // host is about to pick up again on its own. Holding it briefly is what lets a
-    // nudge ("you have not yet marked the task as complete") drop the interim
-    // message instead of sending an answer that is immediately overtaken.
-    //
-    // The hold runs in the background: the hook that posted this event must not be
-    // made to wait for it, or the agent's turn would stall for the whole window.
-    if (type === 'completed' && request.interim === true && this.completionHoldMs > 0) {
-      void this.#holdCompletion({ ...request, type, chatId });
-      return { ok: true, deferred: true, reason: 'held', holdSeconds: Math.round(this.completionHoldMs / 1000) };
-    }
+    // A turn is sent as soon as it finishes: no message is held back. If the agent host
+    // continues the turn and reports a `task_complete` summary afterwards, that summary
+    // arrives as its own message.
 
     const waitForReply = Boolean(request.waitForReply);
     const timeoutSeconds = Math.min(
@@ -461,13 +405,6 @@ export class Notifier {
     let activeCount = 0;
     for (const active of this.activePrompts.values()) {
       if (this.#cancelPrompt(active)) activeCount += 1;
-    }
-    // A held completion belongs to the task being cancelled: sending it afterwards
-    // would report work the user just stopped.
-    for (const [key, entry] of [...this.held]) {
-      clearTimeout(entry.timer);
-      this.held.delete(key);
-      entry.resolve({ ok: true, skipped: true, reason: 'cancelled' });
     }
     return pendingCount + activeCount;
   }
@@ -1000,7 +937,8 @@ export class Notifier {
     const answer = formatAgentMessages(
       {
         type: 'completed',
-        title: `${agent} answered`,
+        // The heading names the agent that answered, the same way the line below does.
+        title: titleForAgent('answered', agent, 'completed'),
         message: result.text,
         // Say where the turn went: a run that joined the editor's session is part of
         // the conversation the panel shows, and one that started its own is a new
@@ -1164,9 +1102,7 @@ export class Notifier {
     }
 
     const where =
-      agent === 'copilot' || agent === 'claude'
-        ? 'VS Code Chat (the session is in your Chat list)'
-        : 'the OpenCode sidebar';
+      agent === 'opencode' ? 'the OpenCode sidebar' : 'VS Code Chat (the session is in your Chat list)';
 
     await this.sendText(
       [
@@ -1263,7 +1199,9 @@ export class Notifier {
     }
 
     const answer = formatAgentMessages(
-      { type: 'completed', title: `${agent} answered`, message: reply.text },
+      { type: 'completed', title: titleForAgent('answered', agent, 'completed'), message: reply.text },
+      // No cwd here: the session's own folder is already in the chat, and the heading says
+      // which agent answered.
       this.config.maxMessageLength,
     );
     try {
@@ -1342,7 +1280,7 @@ export class Notifier {
     if (this.config.remotePromptEnabled) {
       lines.push(
         '',
-        `Any other message is sent as a prompt to <b>${escapeText(this.lastAgent)}</b> in VS Code Chat.`,
+        `Any other message is sent as a prompt to <b>${escapeText(agentLabel(this.lastAgent))}</b> in VS Code Chat.`,
       );
     }
     await this.sendText(lines.join('\n'));
@@ -1391,12 +1329,81 @@ export class Notifier {
         `pending: ${this.pending.size}`,
         `running prompts: ${this.activePrompts.size}`,
         `agents: ${agents}`,
-        ...(this.config.remotePromptEnabled ? [`prompt agent: ${escapeText(this.lastAgent)}`] : []),
+        ...(this.config.remotePromptEnabled ? [`prompt agent: ${escapeText(agentLabel(this.lastAgent))}`] : []),
       ].join('\n'),
     );
   }
 }
 
+/**
+ * How an agent is named in the chat. The event names stay lowercase (`local`,
+ * `copilot`), so a reader sees the same word `/list` shows.
+ *
+ * @param {string} agent
+ * @returns {string}
+ */
+function agentLabel(agent) {
+  return String(agent || 'agent');
+}
+
+/** The display name of an agent, for a notification title. */
+const AGENT_TITLES = {
+  local: 'Local agent',
+  copilot: 'Copilot',
+  opencode: 'OpenCode',
+  claude: 'Claude Code',
+};
+
+/** Phrases that read naturally straight after an agent's name. */
+const NATURAL_SUFFIX = new Set([
+  'finished',
+  'error',
+  'needs attention',
+  'received a prompt',
+  'continued the task on its own',
+  'needs your answer',
+  'task completed',
+  'answered',
+]);
+
+/**
+ * A title that names the agent that reported the event.
+ *
+ * A hook sends its own title ("Copilot finished"), which is wrong for a local harness
+ * reusing the adapter. The title is rebuilt from the agent, so the heading and the
+ * `agent: …` line of a message always agree.
+ *
+ * @param {string} [title]
+ * @param {string} [agent]
+ * @param {string} [type]
+ * @returns {string}
+ */
+export function titleForAgent(title, agent, type) {
+  const name = String(agent || '').trim().toLowerCase();
+  const text = String(title || '').trim();
+  const display = AGENT_TITLES[name];
+  if (!display) return text || TYPE_HINTS[type] || 'TelegramNotify';
+
+  // A title that already names this agent is kept as written.
+  if (text.toLowerCase().startsWith(display.toLowerCase())) return text;
+
+  // A title naming another agent is rebuilt around this one, keeping the rest.
+  const other = /\b(copilot|local agent|opencode|claude code)\b/i.exec(text);
+  const rest = other ? text.slice(other.index + other[0].length).trim() : text;
+  if (other) return `${display}${rest ? ` ${rest}` : ''}`;
+  if (!text) return `${display} ${TYPE_HINTS[type] || 'update'}`;
+  // "finished" and friends read as a sentence after the name; anything else is joined.
+  return NATURAL_SUFFIX.has(text.toLowerCase()) ? `${display} ${text}` : `${display} — ${text}`;
+}
+
+/** The default title for a notification type when the agent sends none. */
+const TYPE_HINTS = {
+  completed: 'finished',
+  error: 'error',
+  question: 'question',
+  permission: 'needs approval',
+  info: 'update',
+};
 function escapeText(value) {
   return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }

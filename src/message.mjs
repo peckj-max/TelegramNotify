@@ -52,7 +52,7 @@ export function folderLabel(value) {
  */
 export function formatNotification(request) {
   const type = TYPE_LABELS[request.type] ? request.type : 'info';
-  const heading = String(request.title ?? '').trim() || TYPE_LABELS[type];
+  const heading = textOf(request.title).trim() || TYPE_LABELS[type];
   const lines = [`<b>${escapeHtml(heading)}</b>`];
 
   const facts = [];
@@ -60,7 +60,7 @@ export function formatNotification(request) {
   if (request.cwd) facts.push(`<code>${escapeHtml(folderLabel(request.cwd))}</code>`);
   if (facts.length) lines.push(facts.join(' · '));
 
-  if (type === 'completed' && !request.message && !request.detail) {
+  if (type === 'completed' && !textOf(request.message) && !textOf(request.detail)) {
     // A bare "finished" line tells the reader nothing; say what is known instead.
     lines.push(request.cwd ? 'Finished — no summary was available from the agent.' : 'Finished.');
   }
@@ -72,6 +72,31 @@ export function formatNotification(request) {
   }
 
   return lines.join('\n');
+}
+
+/**
+ * Text out of a request field that may not be a string: an agent that posts an error
+ * object, or an agent event forwarded as-is. `String(value)` would print
+ * `[object Object]`, which tells the reader nothing.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function textOf(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (value instanceof Error) return String(value.message || value.name || '');
+  if (typeof value === 'object') {
+    const inner = value.message ?? value.error ?? value.reason ?? value.description;
+    if (typeof inner === 'string' && inner.trim()) return inner;
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return '';
+    }
+  }
+  return String(value);
 }
 
 /**
@@ -88,13 +113,12 @@ export function formatNotification(request) {
 export function formatAgentMessages(request, maxLength) {
   const head = formatNotification(request);
 
-  const message = String(request.message ?? '').trim();
-  const detail = request.detail === undefined || request.detail === null ? '' : request.detail;
-  const detailText = typeof detail === 'string' ? detail : JSON.stringify(detail, null, 2);
+  const message = textOf(request.message).trim();
+  const detailText = textOf(request.detail).trim();
 
   const parts = [head];
   if (message) parts.push(markdownToTelegramHtml(message));
-  if (detailText.trim()) {
+  if (detailText) {
     const body = markdownToTelegramHtml(detailText);
     // A detail that is already fenced renders as its own pre block; anything
     // else is quoted so it is visibly separate from the message.

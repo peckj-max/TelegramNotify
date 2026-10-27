@@ -36,7 +36,7 @@ Commands:
   webhook set           Register the Telegram webhook (needs publicUrl)
   webhook info          Show what Telegram currently calls
   webhook delete        Remove the webhook
-  install               Install agent hooks (--agent copilot|claude|opencode|all)
+  install               Install agent hooks (--agent local|copilot|opencode|claude|all)
   config                Print the effective configuration with secrets masked
   pending               List requests waiting for an answer
   status                Bridge health and pending requests
@@ -288,11 +288,11 @@ async function doctor(configOptions, json) {
   lines.push(`bridge           : ${bridgeState}${report.delivery === 'polling' ? pollingState : ''}`);
   lines.push(`agents           : ${Object.entries(report.agents).map(([name, on]) => `${name}=${on ? 'on' : 'off'}`).join(' ')}`);
   if (config.remotePromptEnabled) {
-    lines.push('remote prompts   : on · via VS Code Chat (Copilot) or the agent CLI (Claude, OpenCode)');
+    lines.push('remote prompts   : on · via VS Code Chat (Copilot, Local) or the agent CLI (Claude, OpenCode)');
     lines.push(
       config.sourcePath
-        ? '                   Copilot prompts need the extension in VS Code; Claude and OpenCode run headlessly'
-        : '                   Copilot prompts are submitted through the extension host',
+        ? '                   Copilot and Local prompts need the extension in VS Code; Claude and OpenCode run headlessly'
+        : '                   Copilot and Local prompts are submitted through the extension host',
     );
   } else {
     lines.push('remote prompts   : off');

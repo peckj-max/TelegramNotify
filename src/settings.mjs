@@ -15,9 +15,10 @@ export const ALL_SETTINGS = [
   'notificationsEnabled',
   'botToken',
   'chatId',
+  'agents.local',
   'agents.copilot',
-  'agents.claude',
   'agents.opencode',
+  'agents.claude',
   'notifyOnCompleted',
   'notifyOnStart',
   'replyTimeoutSeconds',
@@ -33,7 +34,6 @@ export const ALL_SETTINGS = [
   'claudeOpenSession',
   'claudeAskWindowSeconds',
   'panelWaitSeconds',
-  'completionHoldSeconds',
 ];
 
 /**
@@ -46,9 +46,10 @@ export function configFromSettings(settings = {}) {
     botToken: settings.botToken,
     chatId: settings.chatId,
     agents: {
+      local: settings['agents.local'],
       copilot: settings['agents.copilot'],
-      claude: settings['agents.claude'],
       opencode: settings['agents.opencode'],
+      claude: settings['agents.claude'],
     },
     notifyOnCompleted: settings.notifyOnCompleted,
     notifyOnStart: settings.notifyOnStart,
@@ -65,7 +66,6 @@ export function configFromSettings(settings = {}) {
     claudeOpenSession: settings.claudeOpenSession,
     claudeAskWindowSeconds: settings.claudeAskWindowSeconds,
     panelWaitSeconds: settings.panelWaitSeconds,
-    completionHoldSeconds: settings.completionHoldSeconds,
   };
   for (const key of Object.keys(raw)) {
     if (raw[key] === undefined || raw[key] === null) delete raw[key];

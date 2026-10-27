@@ -199,7 +199,7 @@ export function installOpencode(root, options = {}) {
  */
 export function install(root, options = {}) {
   const agent = options.agent || 'all';
-  const targets = agent === 'all' ? ['copilot', 'claude', 'opencode'] : [agent];
+  const targets = agent === 'all' ? ['local', 'copilot', 'opencode', 'claude'] : [agent];
   const files = [];
   const notes = [];
 
@@ -216,12 +216,57 @@ export function install(root, options = {}) {
       const result = installOpencode(root, options);
       files.push(...result.files);
       notes.push(...result.notes);
+    } else if (target === 'local') {
+      const result = installLocal(options);
+      files.push(...result.files);
+      notes.push(...result.notes);
     } else {
       throw new Error(`unknown agent "${target}"`);
     }
   }
 
   return { files, notes };
+}
+
+/**
+ * The local agent's hook config.
+ *
+ * A local harness runs on this machine and reports the same events Copilot does, so it
+ * points its hook config at `local-hook.mjs`. Where that config lives is the harness's
+ * own business, so nothing is written unless `TELEGRAM_NOTIFY_LOCAL_HOOKS` names the
+ * file; otherwise the exact block to paste is printed.
+ *
+ * @param {{ global?: boolean }} [options]
+ */
+export function installLocal(options = {}) {
+  const script = hookScript('local-hook.mjs');
+  const hooks = {
+    userPromptSubmitted: [copilotHook(script, 20, 'userPromptSubmitted')],
+    agentStop: [copilotHook(script, 20, 'agentStop')],
+    sessionEnd: [copilotHook(script, 20, 'sessionEnd')],
+    errorOccurred: [copilotHook(script, 20, 'errorOccurred')],
+  };
+  const configured = String(process.env.TELEGRAM_NOTIFY_LOCAL_HOOKS || '').trim();
+
+  if (!configured) {
+    return {
+      files: [],
+      notes: [
+        'The local agent needs no file written by the bridge: point its hook config at src/hooks/local-hook.mjs, or post events to POST /event/local.',
+        `The hooks it should run: ${Object.keys(hooks).join(', ')} (event name as the only argument).`,
+        'Set TELEGRAM_NOTIFY_LOCAL_HOOKS to the harness\'s hook file to have this installer write it.',
+      ],
+    };
+  }
+
+  writeJson(configured, { version: 1, hooks });
+  return {
+    files: [configured],
+    notes: [
+      `Local agent hooks written to ${configured}.`,
+      ...(options.global ? [] : ['Restart the harness, or start a new session, so its hooks reload.']),
+    ],
+  };
 }
 
 function ensureDir(dir) {
@@ -281,6 +326,10 @@ export function isAgentInstalled(agent) {
   if (agent === 'copilot') return exists(path.join(home, '.copilot'));
   if (agent === 'opencode') {
     return exists(path.join(home, '.config', 'opencode')) || exists(path.join(home, '.opencode'));
+  }
+  // A local harness reports for itself; when it is running, it told us so.
+  if (agent === 'local') {
+    return Boolean(String(process.env.TELEGRAM_NOTIFY_LOCAL_HOOKS || '').trim());
   }
   return false;
 }

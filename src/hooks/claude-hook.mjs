@@ -15,7 +15,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { loadConfigForHooks } from '../config.mjs';
 import { log } from '../logger.mjs';
-import { finish, postEvent, readHookInput, shorten } from './adapter-utils.mjs';
+import { errorTextOf, finish, postEvent, readHookInput, shorten } from './adapter-utils.mjs';
 import { AUTOMATED_MODES, askPlan, askReplyPrompt, claudePermissionMode } from './ask.mjs';
 import { findTranscript, readLastAssistantMessage } from './transcript.mjs';
 
@@ -223,7 +223,7 @@ async function handleCompleted(eventName, input) {
     type: 'completed',
     title: eventName === 'TaskCompleted' ? 'Claude Code task completed' : 'Claude Code finished',
     message: found.text || undefined,
-    detail: eventName === 'StopFailure' ? shorten(input.error || input.reason || '', 4000) : '',
+    detail: eventName === 'StopFailure' ? shorten(errorTextOf(input.error ?? input.reason, ''), 4000) : '',
     cwd: input.cwd || '',
     // Ends the running prompt this turn belonged to.
     sessionId,

@@ -53,6 +53,7 @@ export class CopilotEventWatcher {
    *   directory?: () => string[],
    *   enabled?: () => boolean,
    *   onPending?: (entry: any) => unknown,
+   *   onTurn?: (turn: { type: 'started'|'ended', sessionId: string, prompt: string, cwd: string, at: number }) => void,
    *   log?: (level: 'debug'|'info'|'warn', message: string) => void,
    *   now?: () => number,
    * }} [options]
@@ -64,6 +65,7 @@ export class CopilotEventWatcher {
     this.directory = options.directory || (() => []);
     this.enabled = options.enabled || (() => true);
     this.onPending = options.onPending;
+    this.onTurn = options.onTurn;
     this.now = options.now || (() => Date.now());
     this.log = options.log || ((level, message) => log[level]?.(message));
     /** @type {Map<string, any>} */
@@ -135,6 +137,8 @@ export class CopilotEventWatcher {
         sessionId,
         cwd: '',
         mode: '',
+        model: '',
+        agent: 'copilot',
         allowAll: false,
         pending: new Map(),
         tools: new Map(),
@@ -231,6 +235,38 @@ export class CopilotEventWatcher {
   }
 
   /**
+   * The agent that owns a session.
+   *
+   * The Copilot CLI harness and a local harness on this machine write the *same*
+   * session files — same `producer`, same model, same events — so the model cannot say
+   * which one it was. Only the harness itself knows, so it says so when it reports
+   * (its own hook config, `TELEGRAM_NOTIFY_HOOK_AGENT`, or a direct `POST /event/local`),
+   * and the bridge records it here. Until then a session is Copilot, which is what the
+   * installed Copilot hooks report.
+   *
+   * @param {any} state
+   * @returns {string}
+   */
+  agentOf(state) {
+    return String(state?.agent || 'copilot');
+  }
+
+  /**
+   * Records the agent that reported a session, so its prompts are labelled the same way.
+   *
+   * @param {string} sessionId
+   * @param {string} agent
+   */
+  setSessionAgent(sessionId, agent) {
+    const id = String(sessionId || '').trim();
+    const name = String(agent || '').trim().toLowerCase();
+    if (!id || !name) return;
+    for (const state of this.files.values()) {
+      if (state.sessionId === id) state.agent = name;
+    }
+  }
+
+  /**
    * @param {any} state
    * @param {any} event
    */
@@ -240,6 +276,11 @@ export class CopilotEventWatcher {
       case 'session.start':
         state.cwd = String(data.context?.cwd || data.cwd || state.cwd || '');
         state.mode = String(data.mode || state.mode || '');
+        state.model = String(data.selectedModel || state.model || '');
+        break;
+      case 'model-switched':
+      case 'session.model_change':
+        state.model = String(data.newModel || data.model || state.model || '');
         break;
       case 'session.mode_changed':
         state.mode = String(data.newMode || state.mode || '');
@@ -254,6 +295,7 @@ export class CopilotEventWatcher {
         state.pending.set(`permission:${id}`, {
           kind: 'permission',
           sessionId: state.sessionId,
+          agent: this.agentOf(state),
           requestId: String(data.requestId || ''),
           toolCallId: String(request.toolCallId || ''),
           tool: String(state.tools.get(request.toolCallId)?.toolName || ''),
@@ -274,6 +316,7 @@ export class CopilotEventWatcher {
           state.pending.set(`question:${data.toolCallId}`, {
             kind: 'question',
             sessionId: state.sessionId,
+            agent: this.agentOf(state),
             toolCallId: String(data.toolCallId || ''),
             toolName: String(data.toolName || ''),
             arguments: data.arguments || {},
@@ -290,13 +333,53 @@ export class CopilotEventWatcher {
       // A new user turn, a finished task or a closed session means whatever was
       // waiting has been answered or abandoned.
       case 'user.message':
-      case 'session.shutdown':
+        state.pending.clear();
+        this.#reportTurn(state, 'started', data, event);
+        break;
+      // The turn is over — finished, stopped from the panel, or interrupted. Whatever
+      // was waiting is gone, and the prompt is no longer running, so `/list` stops
+      // showing it. `agentStop` does not fire when the stop button is pressed, which is
+      // why the event log is the signal here.
+      case 'assistant.turn_end':
       case 'abort':
+        state.pending.clear();
+        this.#reportTurn(state, 'ended', data, event);
+        break;
+      case 'session.shutdown':
       case 'session.task_complete':
         state.pending.clear();
+        this.#reportTurn(state, 'ended', data, event);
         break;
       default:
         break;
+    }
+  }
+
+  /**
+   * Tells the bridge that a session started or stopped working, so a prompt the panel
+   * or a terminal started is listed while it runs and disappears when it ends.
+   *
+   * @param {any} state
+   * @param {'started'|'ended'} type
+   * @param {any} data
+   * @param {any} event
+   */
+  #reportTurn(state, type, data, event) {
+    if (!this.onTurn) return;
+    if (type === 'started' && !this.enabled()) return;
+    const prompt = type === 'started' ? String(data?.content ?? data?.transformedContent ?? '').trim() : '';
+    try {
+      this.onTurn({
+        type,
+        sessionId: state.sessionId,
+        agent: this.agentOf(state),
+        model: state.model,
+        prompt,
+        cwd: String(state.cwd || ''),
+        at: this.#timeOf(event),
+      });
+    } catch (err) {
+      this.log('debug', `could not report the turn of ${state.sessionId}: ${err.message}`);
     }
   }
 
@@ -374,14 +457,18 @@ export class CopilotEventWatcher {
 export function notificationFor(entry) {
   const waited = Number(entry.waitedSeconds) || 0;
   const footer = waited ? `The panel has been waiting for ${waited}s.` : '';
+  // A session on a locally configured model is a local agent, and the message says so
+  // instead of naming Copilot.
+  const agent = entry.agent === 'local' ? 'local' : 'copilot';
+  const name = agent === 'local' ? 'Local agent' : 'Copilot';
   if (entry.kind === 'question') {
     const args = entry.arguments || {};
     return {
       type: 'question',
-      agent: 'copilot',
+      agent,
       cwd: entry.cwd || '',
-      title: 'Copilot is waiting for your answer',
-      message: String(args.message || 'Copilot asked a question.'),
+      title: `${name} is waiting for your answer`,
+      message: String(args.message || `${name} asked a question.`),
       detail: [fieldSummary(args.requestedSchema), footer].filter(Boolean).join('\n\n'),
     };
   }
@@ -391,17 +478,17 @@ export function notificationFor(entry) {
   const intention = String(request.intention || '').trim();
   const detail = [permissionDetail(request), footer].filter(Boolean).join('\n\n');
   const titles = {
-    shell: 'Copilot needs approval to run a command',
-    write: 'Copilot needs approval to write a file',
-    read: 'Copilot needs approval to read a file',
-    url: 'Copilot needs approval to open a URL',
-    'extension-management': 'Copilot needs approval to manage extensions',
+    shell: `${name} needs approval to run a command`,
+    write: `${name} needs approval to write a file`,
+    read: `${name} needs approval to read a file`,
+    url: `${name} needs approval to open a URL`,
+    'extension-management': `${name} needs approval to manage extensions`,
   };
   return {
     type: 'permission',
-    agent: 'copilot',
+    agent,
     cwd: entry.cwd || '',
-    title: titles[kind] || `Copilot needs approval (${kind})`,
+    title: titles[kind] || `${name} needs approval (${kind})`,
     message:
       intention ||
       firstLine(request.fullCommandText) ||

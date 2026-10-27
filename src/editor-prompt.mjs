@@ -23,7 +23,7 @@
  * @typedef {object} EditorSubmitResult
  * @property {boolean} ok
  * @property {'submitted'|'opened'|'unsupported'} outcome
- * @property {'copilot'|'claude'|'opencode'} agent
+ * @property {'local'|'copilot'|'claude'|'opencode'} agent
  * @property {string} [detail]
  * @property {string} [error]
  * @property {boolean} [needsAnswerFromEditor] the answer appears in the editor, not in Telegram
@@ -32,12 +32,12 @@
 /**
  * @param {object} options
  * @param {(command: string, ...args: any[]) => Thenable<any>} options.executeCommand
- * @param {'copilot'|'claude'|'opencode'} options.agent
+ * @param {'local'|'copilot'|'claude'|'opencode'} options.agent
  * @param {string} options.prompt
  * @returns {Promise<EditorSubmitResult>}
  */
 export async function submitToEditor({ executeCommand, agent, prompt }) {
-  const text = String(prompt ?? '').trim();
+  const text = String(prompt || '').trim();
   if (!text) return { ok: false, outcome: 'unsupported', agent, error: 'the prompt is empty' };
 
   if (agent === 'copilot') {
@@ -61,6 +61,24 @@ export async function submitToEditor({ executeCommand, agent, prompt }) {
           error: `VS Code could not submit to Chat: ${err?.message || err}`,
         };
       }
+    }
+  }
+
+  if (agent === 'local') {
+    // The Local harness is the same Chat widget as Copilot's, selected in the agent
+    // picker, so it takes the prompt exactly the same way. No `mode` is passed: that
+    // would move the prompt into the Copilot harness and out of the local one, which
+    // is the session the user is watching.
+    try {
+      await executeCommand('workbench.action.chat.open', { query: text, isPartialQuery: false });
+      return { ok: true, outcome: 'submitted', agent, needsAnswerFromEditor: true };
+    } catch (err) {
+      return {
+        ok: false,
+        outcome: 'unsupported',
+        agent,
+        error: `VS Code could not submit to the local chat: ${err?.message || err}`,
+      };
     }
   }
 

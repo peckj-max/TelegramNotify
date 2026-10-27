@@ -42,6 +42,7 @@ const BRIDGE_SETTING_KEYS = [
   'notifyOnCompleted',
   'notifyOnStart',
   'maxMessageLength',
+  'agents.local',
   'agents.copilot',
   'agents.claude',
   'agents.opencode',
@@ -49,7 +50,6 @@ const BRIDGE_SETTING_KEYS = [
   'claudeOpenSession',
   'claudeAskWindowSeconds',
   'panelWaitSeconds',
-  'completionHoldSeconds',
 ];
 
 /** A double click delivers two command invocations; collapse them into one. */
@@ -83,6 +83,11 @@ async function ensureHooks(runtime) {
       // OpenCode 2.x rejects a plugin file (it wants a directory) and its plugin
       // API cannot report turns, so its sessions are watched over the HTTP API
       // instead — see startOpenCodeWatcher.
+      continue;
+    }
+    if (agent === 'local') {
+      // A local harness has its own hook config: it calls src/hooks/local-hook.mjs (or
+      // posts to /event/local) and there is nothing for the bridge to install.
       continue;
     }
     if (!isAgentInstalled(agent)) {
@@ -202,7 +207,10 @@ function makeSessionOpener() {
 function makeChatReplyReader() {
   let cached = null;
   return async ({ agent, prompt, sinceMs, timeoutMs, shouldStop }) => {
-    if (agent !== 'copilot') {
+    // The local harness is the same Chat widget and writes the same session log, so its
+    // answer is read exactly like Copilot's. Claude and OpenCode have nothing here: their
+    // answers arrive from the agent's own hooks or its UI.
+    if (agent !== 'copilot' && agent !== 'local') {
       // Nothing to wait for: an answer posted by the agent's hooks, or one that
       // only exists in the agent's own UI.
       return { ok: true, text: '', unsupported: true };
@@ -615,6 +623,29 @@ async function startCopilotWatcher(notifier, runtime) {
           log(`copilot ${entry.kind} notification could not be sent: ${result.reason || result.error || 'unknown reason'}`);
         }
       },
+      // A prompt started in the panel or a terminal is work in progress: listed while
+      // it runs, gone when it ends. The event log is the signal the hooks cannot give —
+      // pressing Stop ends the turn without firing `agentStop`.
+      onTurn: (turn) => {
+        // A harness that reported itself as local keeps that name for the session; a
+        // Copilot session stays Copilot, since nothing else can tell them apart.
+        if (turn.agent === 'local') notifier.assignSessionAgent(turn.sessionId, 'local');
+        if (turn.type === 'started') {
+          if (!turn.prompt) return; // the host's own nudge, or a turn resumed from a menu
+          const active = notifier.trackRunningPrompt({
+            agent: turn.agent,
+            prompt: turn.prompt,
+            sessionId: turn.sessionId,
+            startedAt: turn.at,
+          });
+          log(`${turn.agent} turn started in ${turn.sessionId}; running prompt ${active.id}`);
+        } else if (notifier.finishRunningPrompt(turn.sessionId)) {
+          log(`${turn.agent} turn in ${turn.sessionId} is no longer running`);
+        } else {
+          return;
+        }
+        if (bridge) refreshStatus();
+      },
     }).start();
   } catch (err) {
     log(`could not watch copilot sessions: ${err.message}`);
@@ -809,9 +840,10 @@ async function installHooks() {
   const agents = await vscode.window.showQuickPick(
     [
       { label: 'All agents', picked: true, value: 'all' },
-      { label: 'Claude Code', picked: true, value: 'claude' },
+      { label: 'Local agent', picked: true, value: 'local' },
       { label: 'GitHub Copilot', picked: true, value: 'copilot' },
       { label: 'OpenCode', picked: true, value: 'opencode' },
+      { label: 'Claude Code', picked: true, value: 'claude' },
     ],
     { title: 'Agents to hook', canPickMany: true },
   );
@@ -819,7 +851,9 @@ async function installHooks() {
 
   try {
     const installer = await import(pathToFileURL(path.join(ROOT, 'src', 'install.mjs')).href);
-    const selected = agents.some((item) => item.value === 'all') ? ['copilot', 'claude', 'opencode'] : agents.map((item) => item.value);
+    const selected = agents.some((item) => item.value === 'all')
+      ? ['local', 'copilot', 'opencode', 'claude']
+      : agents.map((item) => item.value);
     if (!selected.length) {
       vscode.window.showWarningMessage('Nothing to install.');
       return;
@@ -836,7 +870,7 @@ async function installHooks() {
     for (const file of files) log(`installed ${file}`);
     vscode.window
       .showInformationMessage(
-        `Hooks installed (${files.length} files). Restart ${['Claude Code', 'Copilot', 'OpenCode'].join(', ')} to pick them up.`,
+        `Hooks installed (${files.length} files). Restart ${['Local agent', 'Copilot', 'OpenCode', 'Claude Code'].join(', ')} to pick them up.`,
         'Show Files',
       )
       .then((choice) => {

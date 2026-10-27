@@ -7,7 +7,22 @@ import { ALL_SETTINGS } from './settings.mjs';
 
 export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-export const AGENTS = /** @type {const} */ (['copilot', 'claude', 'opencode']);
+/**
+ * Every agent the bridge accepts events from.
+ *
+ * `local` is a harness that runs on this machine and posts its own events; nothing is
+ * installed for it and the bridge cannot start a prompt in it, but its turns are
+ * notifications like any other.
+ */
+export const AGENTS = /** @type {const} */ (['local', 'copilot', 'opencode', 'claude']);
+
+/**
+ * Agents a Telegram prompt can be sent to.
+ *
+ * A local agent runs in the editor's Chat panel exactly as Copilot does, so a prompt
+ * is delivered the same way.
+ */
+export const PROMPT_AGENTS = /** @type {const} */ (['local', 'copilot', 'opencode', 'claude']);
 
 export const DEFAULTS = {
   webhookHost: '0.0.0.0',
@@ -31,10 +46,6 @@ export const DEFAULTS = {
   // Unlike the ask window above this never blocks: the agent's own prompt owns the
   // request, and the event log only says whether it is still waiting.
   panelWaitSeconds: 20,
-  // Seconds a completion is held when its turn stopped without reporting a result.
-  // The Copilot agent host nudges such a turn to continue, and that nudge drops the
-  // held message instead of Telegram showing an answer that is immediately overtaken.
-  completionHoldSeconds: 15,
 };
 
 /**
@@ -42,7 +53,7 @@ export const DEFAULTS = {
  * @property {string} botToken
  * @property {string[]} chatIds
  * @property {boolean} notificationsEnabled
- * @property {Record<'copilot'|'claude'|'opencode', boolean>} agents
+ * @property {Record<'local'|'copilot'|'opencode'|'claude', boolean>} agents
  * @property {boolean} webhookEnabled
  * @property {number} webhookPort
  * @property {string} webhookHost
@@ -58,7 +69,6 @@ export const DEFAULTS = {
  * @property {boolean} claudeOpenSession
  * @property {number} claudeAskWindowSeconds
  * @property {number} panelWaitSeconds
- * @property {number} completionHoldSeconds
  * @property {string|null} sourcePath
  */
 
@@ -240,9 +250,10 @@ export function normalizeConfig(raw, options = {}) {
       DEFAULTS.notificationsEnabled,
     ),
     agents: {
+      local: asBoolean(env.TELEGRAM_NOTIFY_AGENT_LOCAL ?? agentsInput.local, true),
       copilot: asBoolean(env.TELEGRAM_NOTIFY_AGENT_COPILOT ?? agentsInput.copilot, true),
-      claude: asBoolean(env.TELEGRAM_NOTIFY_AGENT_CLAUDE ?? agentsInput.claude, true),
       opencode: asBoolean(env.TELEGRAM_NOTIFY_AGENT_OPENCODE ?? agentsInput.opencode, true),
+      claude: asBoolean(env.TELEGRAM_NOTIFY_AGENT_CLAUDE ?? agentsInput.claude, true),
     },
     webhookEnabled: asBoolean(env.TELEGRAM_NOTIFY_WEBHOOK_ENABLED ?? raw.webhookEnabled, DEFAULTS.webhookEnabled),
     webhookPort: asPositiveInt(env.TELEGRAM_NOTIFY_WEBHOOK_PORT || raw.webhookPort, DEFAULTS.webhookPort),
@@ -270,10 +281,6 @@ export function normalizeConfig(raw, options = {}) {
     panelWaitSeconds: asNonNegativeInt(
       env.TELEGRAM_NOTIFY_PANEL_WAIT ?? raw.panelWaitSeconds,
       DEFAULTS.panelWaitSeconds,
-    ),
-    completionHoldSeconds: asNonNegativeInt(
-      env.TELEGRAM_NOTIFY_COMPLETION_HOLD ?? raw.completionHoldSeconds,
-      DEFAULTS.completionHoldSeconds,
     ),
     sourcePath: options.sourcePath ?? null,
   };

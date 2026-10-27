@@ -108,16 +108,16 @@
           "markdownDescription": "Chat that receives notifications. A numeric user id, a group id starting with `-`, or several separated by commas. Only these chats may answer a request.",
           "order": 3
         },
+        "telegramNotify.agents.local": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Send events from a **local agent** to Telegram.\n\n**Local harness** (VS Code agent picker) turns are reported as `local` — **Local agent finished** with `local` under the heading, and `local` in `/list` and `/start` — while **Copilot harness** turns stay `Copilot`. The harness is read from the hook payload (`hook_event_name` vs `sessionId`), because both run the same hooks and write the same transcripts. Nothing needs installing for the built-in local harness. A harness of your own can report the same way: `src/hooks/local-hook.mjs`, `TELEGRAM_NOTIFY_HOOK_AGENT=local`, or `POST /event/local`.",
+          "order": 4
+        },
         "telegramNotify.agents.copilot": {
           "type": "boolean",
           "default": true,
           "markdownDescription": "Send GitHub Copilot events to Telegram.",
-          "order": 4
-        },
-        "telegramNotify.agents.claude": {
-          "type": "boolean",
-          "default": true,
-          "markdownDescription": "Send Claude Code events to Telegram, and return permission and question answers to it for a prompt Telegram started. A turn you start in the Chat panel or a terminal asks for approval there, like Copilot.",
           "order": 5
         },
         "telegramNotify.agents.opencode": {
@@ -126,24 +126,30 @@
           "markdownDescription": "Send OpenCode events to Telegram, and return permission answers to it.",
           "order": 6
         },
+        "telegramNotify.agents.claude": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Send Claude Code events to Telegram, and return permission and question answers to it for a prompt Telegram started. A turn you start in the Chat panel or a terminal asks for approval there, like Copilot.",
+          "order": 7
+        },
         "telegramNotify.notifyOnCompleted": {
           "type": "boolean",
           "default": true,
           "markdownDescription": "Send a notification when a task or session finishes.",
-          "order": 7
+          "order": 8
         },
         "telegramNotify.notifyOnStart": {
           "type": "boolean",
           "default": false,
           "markdownDescription": "Copilot only: announce that a prompt was submitted.",
-          "order": 8
+          "order": 9
         },
         "telegramNotify.replyTimeoutSeconds": {
           "type": "number",
           "default": 900,
           "minimum": 30,
           "markdownDescription": "How long a blocked agent waits for a Telegram answer before it falls back to its terminal prompt.",
-          "order": 9
+          "order": 10
         },
         "telegramNotify.maxMessageLength": {
           "type": "number",
@@ -151,13 +157,13 @@
           "minimum": 200,
           "maximum": 4096,
           "markdownDescription": "Size of one Telegram message. Longer output is **split into several messages** (never truncated), each kept under this length.",
-          "order": 10
+          "order": 11
         },
         "telegramNotify.webhookEnabled": {
           "type": "boolean",
           "default": true,
           "markdownDescription": "**Enable Webhook.** On: the bridge listens for Telegram calls on `webhookPort` and registers `publicUrl` with Telegram. Off: the webhook is removed and answers are collected by **long polling** instead, so no public URL or nginx is needed.\n\nThe bridge stays local either way, because the agent hooks call it on loopback.",
-          "order": 11
+          "order": 12
         },
         "telegramNotify.webhookPort": {
           "type": "number",
@@ -165,31 +171,31 @@
           "minimum": 1,
           "maximum": 65535,
           "markdownDescription": "Port for the webhook and the loopback API the agent hooks call. Used in both delivery modes.",
-          "order": 12
+          "order": 13
         },
         "telegramNotify.webhookHost": {
           "type": "string",
           "default": "0.0.0.0",
           "markdownDescription": "Interface the bridge binds to. `0.0.0.0` lets a reverse proxy reach it; `127.0.0.1` keeps it local-only, which is all polling needs.",
-          "order": 13
+          "order": 14
         },
         "telegramNotify.webhookPath": {
           "type": "string",
           "default": "/telegram/webhook",
           "markdownDescription": "Webhook path. `/telegram/webhook` and `/webhook` are also accepted.",
-          "order": 14
+          "order": 15
         },
         "telegramNotify.webhookSecretToken": {
           "type": "string",
           "default": "",
           "markdownDescription": "Secret Telegram echoes in the `X-Telegram-Bot-Api-Secret-Token` header of every webhook call. Only `A-Z a-z 0-9 _ -` are allowed.\n\nLeave empty and TelegramNotify generates one on first start. Not used in polling mode.",
-          "order": 15
+          "order": 16
         },
         "telegramNotify.publicUrl": {
           "type": "string",
           "default": "",
           "markdownDescription": "Public HTTPS base URL of the reverse proxy in front of the bridge, for example `https://www.example.com`. When set, the webhook is registered on every start. Ignored in polling mode.",
-          "order": 16
+          "order": 17
         },
         "telegramNotify.pollingTimeoutSeconds": {
           "type": "number",
@@ -197,19 +203,19 @@
           "minimum": 1,
           "maximum": 50,
           "markdownDescription": "Long-polling wait per Telegram request, used only when **Enable Webhook** is off. 25 keeps the reply latency low without hammering the API.",
-          "order": 17
+          "order": 18
         },
         "telegramNotify.remotePromptEnabled": {
           "type": "boolean",
           "default": false,
           "markdownDescription": "**Accept prompts from Telegram.** A message that is not a command or an answer is run as a prompt for the agent used most recently (Copilot until another agent reports an event), and the answer is posted back to the chat. Copilot and Claude run in VS Code Chat, in the session on screen; a Claude prompt Chat cannot take falls back to Claude Code's own runtime.\n\nAnyone who can write in the configured chat can run the agent on this machine, so this is off by default.",
-          "order": 18
+          "order": 19
         },
         "telegramNotify.claudeOpenSession": {
           "type": "boolean",
           "default": true,
           "markdownDescription": "**Show the Claude Code session.** Applies to the fallback path only: when Chat cannot take a Telegram prompt and it runs through Claude Code's own runtime, open the session it joined in its panel or sidebar, so the prompt belongs to a conversation you can see.\n\nThe fallback run resumes the session the editor has open and posts the complete answer to Telegram when the turn ends; Claude Code renders a session when it loads it, so reopen or reload that tab to see the turn.",
-          "order": 19
+          "order": 20
         },
         "telegramNotify.claudeAskWindowSeconds": {
           "type": "number",
@@ -217,7 +223,7 @@
           "minimum": 0,
           "maximum": 3600,
           "markdownDescription": "**Ask a question in Telegram first.** Seconds a blocking agent question — Claude Code's `AskUserQuestion` — waits for an answer in the chat before its own prompt takes over.\n\nWith TelegramNotify on (the default) the chat gets the question's options first: tap one and the turn continues; if nothing answers within this window the message is replaced with `⌛ no answer after Ns`, its buttons are cleared, and the question is left to the panel or terminal. Whichever place answers first wins.\n\n`0` turns the Telegram step off, so only the panel or terminal asks. Permission requests are not routed through this window: they are reported after the agent's own prompt appears (see `panelWaitSeconds`), because a permission hook runs before the agent decides whether to ask at all.",
-          "order": 20
+          "order": 21
         },
         "telegramNotify.panelWaitSeconds": {
           "type": "number",
@@ -225,14 +231,6 @@
           "minimum": 0,
           "maximum": 3600,
           "markdownDescription": "**Report prompts waiting in the panel.** Seconds a Copilot `permission.requested` or `ask_user` may stay unanswered before Telegram is told about it.\n\nThis is passive: no hook blocks, and the request is not answered from Telegram. It only fires when Copilot's own permission service or question prompt is actually waiting, so calls that are auto-approved are never reported. `0` turns the report off.",
-          "order": 21
-        },
-        "telegramNotify.completionHoldSeconds": {
-          "type": "number",
-          "default": 15,
-          "minimum": 0,
-          "maximum": 600,
-          "markdownDescription": "**One message per task, not per turn.** Seconds a finished turn is held when it stopped *without* reporting its result (no `task_complete`).\n\nThe Copilot agent host stops such a turn, then nudges it to continue (\"you have not yet marked the task as complete\") and the agent finishes moments later. A held completion is dropped when that nudge arrives, replaced when a newer turn of the same session finishes, and sent first when a real new prompt starts in that window, so nothing is lost. `0` sends every completion at once.",
           "order": 22
         },
         "telegramNotify.logLevel": {
@@ -246,7 +244,7 @@
             "debug"
           ],
           "markdownDescription": "Verbosity of the TelegramNotify output channel.",
-          "order": 22
+          "order": 23
         }
       }
     }

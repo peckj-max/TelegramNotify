@@ -14,7 +14,8 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { loadConfigForHooks } from '../config.mjs';
 import { log } from '../logger.mjs';
-import { finish, postEvent, readHookInput, shorten } from './adapter-utils.mjs';
+import { withoutLeadIn } from '../answer.mjs';
+import { agentOf as detectAgent, errorTextOf, finish, postEvent, readHookInput, shorten } from './adapter-utils.mjs';
 import { findTranscript, isSystemPromptOf, readLastAssistantMessage } from './transcript.mjs';
 
 const COMPLETED_EVENTS = new Set(['sessionend', 'agentstop', 'taskcomplete', 'stop', 'complete', 'finished']);
@@ -22,8 +23,58 @@ const COMPLETED_EVENTS = new Set(['sessionend', 'agentstop', 'taskcomplete', 'st
 /** The installer passes the event name, because not every host sends it on stdin. */
 const EVENT_ARGUMENT = process.argv.slice(2).find((value) => !value.startsWith('-'));
 
+/**
+ * Which agent is reporting, decided from the payload when it says so.
+ *
+ * Two harnesses send these hooks with the same command line, so the argument cannot
+ * tell them apart and neither can the transcript's contents:
+ *
+ * - **Copilot** (the agent host) sends camelCase fields — `sessionId`,
+ *   `transcriptPath`, `stopReason` — and keeps its session under
+ *   `~/.copilot/session-state/<id>/events.jsonl`.
+ * - **Local harness** (VS Code's in-process Copilot Chat agent) sends the Claude-style
+ *   snake_case fields — `hook_event_name`, `session_id`, `transcript_path` — and keeps
+ *   its transcript under `…/workspaceStorage/<ws>/GitHub.copilot-chat/transcripts/`.
+ *
+ * `--agent local` and `TELEGRAM_NOTIFY_HOOK_AGENT=local` still force the local name, for
+ * a harness of your own that reuses this adapter.
+ *
+ * @param {any} input the hook payload
+ * @returns {'local'|'copilot'}
+ */
+export function agentOf(input) {
+  const forced = agentArgument();
+  return detectAgent(input, { forced });
+}
+
+/**
+ * An explicit `--agent` / env override, when one was given.
+ *
+ * @returns {'local'|''}
+ */
+function agentArgument() {
+  const inline = process.argv.slice(2).find((value) => value.startsWith('--agent='));
+  const index = process.argv.indexOf('--agent');
+  const named =
+    (inline ? inline.slice('--agent='.length) : '') ||
+    (index > 0 ? process.argv[index + 1] ?? '' : '') ||
+    process.env.TELEGRAM_NOTIFY_HOOK_AGENT ||
+    '';
+  return String(named).trim().toLowerCase() === 'local' ? 'local' : '';
+}
+
+/** The agent that will report this payload. */
+let AGENT = 'copilot';
+
+/** How the agent is named in a fallback message. */
+function label() {
+  return AGENT === 'local' ? 'Local agent' : 'Copilot';
+}
+
 async function main() {
   const input = await readHookInput();
+  // The payload says which harness sent it; everything below reports under that name.
+  AGENT = agentOf(input);
   const eventName = normalizeEvent(
     EVENT_ARGUMENT ||
       input.hookEventName ||
@@ -46,10 +97,11 @@ async function main() {
       const synthetic = isSystemPromptOf(prompt);
       // Always report it: the bridge records which agent is in use, so the next
       // Telegram prompt goes there. Only `notifyOnStart` makes it a message.
-      await postEvent('copilot', {
-        agent: 'copilot',
+      await postEvent(AGENT, {
+        agent: AGENT,
         type: 'info',
-        title: synthetic ? 'Copilot continued the task on its own' : 'Copilot received a prompt',
+        // The bridge names the agent; this stays neutral so the local harness can reuse it.
+        title: synthetic ? 'continued the task on its own' : 'received a prompt',
         message: shorten(prompt, 600),
         cwd: cwdOf(input),
         // A prompt started in the Chat panel is work in progress: the bridge lists
@@ -96,11 +148,25 @@ function promptOf(input) {
   return input.prompt || input.message || input.userMessage || input.user_message || '';
 }
 
+/**
+ * The failure an `ErrorOccurred` (Copilot) or `StopFailure` (local harness) reports.
+ *
+ * @param {any} input
+ * @returns {string}
+ */
+function errorOf(input) {
+  return errorTextOf(input.error ?? input.errorMessage ?? input.message, `${label()} reported an error.`);
+}
+
 async function handleError(input) {
-  await postEvent('copilot', {
+  await postEvent(AGENT, {
     type: 'error',
-    title: 'Copilot error',
-    message: input.error || input.errorMessage || input.message || 'Copilot reported an error.',
+    title: 'error',
+    // The host sends an object (`{ name, message, stack }`), and its message may itself
+    // be JSON; passing either straight through reaches the chat as "[object Object]".
+    message: errorOf(input),
+    // The context says which step failed, which the message alone usually does not.
+    detail: shorten(input.errorContext ?? input.error_context ?? '', 1500),
     cwd: cwdOf(input),
   });
   return finish(null);
@@ -109,11 +175,15 @@ async function handleError(input) {
 async function handleCompleted(eventName, input) {
   const sessionId = input.sessionId || input.session_id || '';
   const transcript = findTranscript({
-    hint: input.transcriptPath || input.transcript_path || input.transcriptFile,
+    // The local harness names its transcript in `transcript_path`; the Copilot host uses
+    // `transcriptPath`. Either way the hint is where the turn's answer is.
+    hint: input.transcriptPath || input.transcript_path || input.transcriptFile || '',
     sessionId,
   });
   const found = await readLastAssistantMessage(transcript);
-  const summary = input.message || input.result || found.text;
+  // What a hook payload carries itself beats the transcript: a host that sends the
+  // answer in the payload does not need it read from a file.
+  const payloadText = String(input.message || input.result || '').trim();
 
   // Copilot fires agentStop and then sessionEnd for the same finish, and may
   // repeat either. Copilot's own event names are the distinction: only agentStop
@@ -124,39 +194,56 @@ async function handleCompleted(eventName, input) {
     return finish(null);
   }
 
-  // A host that repeats agentStop must not notify twice for the same turn. The
-  // transcript identifies the turn: its last message id, whether that turn reported
-  // its result, and its text. The reported flag matters because the host stops a turn
-  // that has not finished (no `task_complete`), nudges it, and then stops it again —
-  // both stops share the answer's message id, so id alone would swallow the second,
-  // finished one and the prompt would never reach the chat.
-  //
-  // With no text there is nothing to compare, and the turn must be reported rather
-  // than dropped: claimCompletion allows an empty key.
-  const content = found.text || summary || '';
-  const turnKey = content ? `${found.id}|${found.reported}|${content}` : '';
-  if (!claimCompletion(sessionId, turnKey)) {
+  // One message per turn: the answer is sent as soon as the turn ends, and the
+  // `task_complete` summary follows as its own message if the host reports it later.
+  // What was already sent for this session decides that, because the host repeats
+  // `agentStop` (and Copilot's own nudged continuation re-stops the same answer).
+  const full = String(payloadText || found.text || '').trim();
+  const answer = String(payloadText || found.answer || '').trim();
+  const reported = String(found.summary ?? '').trim();
+  const answerHash = answer ? hash(answer) : '';
+  const summaryHash = reported ? hash(reported) : '';
+  const sent = readSent(sessionId);
+  const fresh = !sent || Date.now() - (Number(sent.at) || 0) > STOP_DEDUPE_MS;
+  const known = fresh ? {} : sent;
+
+  // What is actually new for this session. The answer is what the reader has seen; the
+  // summary is what the host reported afterwards.
+  const answerIsNew = Boolean(answerHash) && known.answer !== answerHash;
+  const summaryIsNew = Boolean(summaryHash) && known.summary !== summaryHash;
+
+  if (!answerIsNew && !summaryIsNew && (answerHash || summaryHash)) {
     log.debug(`duplicate completion for session ${sessionId} ignored`);
     return finish(null);
   }
 
-  await postEvent('copilot', {
+  // The answer was already sent, so only the summary is new: it goes out on its own.
+  const summaryOnly = summaryIsNew && !answerIsNew && Boolean(answerHash);
+
+  await postEvent(AGENT, {
     type: 'completed',
-    title: eventName === 'notification' ? 'Copilot needs attention' : 'Copilot finished',
-    message: summary || undefined,
+    // The bridge names the agent in the heading (`titleForAgent`), so the hook sends
+    // the event, not a product name — the local harness reuses this adapter.
+    title: eventName === 'notification' ? 'needs attention' : summaryOnly ? 'task completed' : 'finished',
+    // The summary stands alone in this message, so its meta lead-in ("Answered the
+    // factual question:") would only be noise: the heading already says what it is.
+    message: summaryOnly ? withoutLeadIn(reported) : full || reported || undefined,
     // Say why it stopped when there is nothing else to show, instead of leaving
     // the reader with a bare "task finished".
     detail:
-      summary || !(input.stopReason || input.stop_reason)
+      full || reported || !(input.stopReason || input.stop_reason)
         ? ''
         : `stop reason: ${input.stopReason || input.stop_reason}\nsession: ${sessionId || 'unknown'}`,
     cwd: cwdOf(input),
     // Ends the running prompt this turn belonged to.
     sessionId,
-    // A turn that stopped without reporting its result may be continued by the host
-    // on its own; the bridge holds it instead of sending an answer that will be
-    // overtaken seconds later.
-    ...(found.reported === false ? { interim: true } : {}),
+  });
+
+  // Keep the summary already reported: a later repeat must not look unreported.
+  writeSent(sessionId, {
+    answer: answerHash || sent?.answer || '',
+    summary: summaryHash || sent?.summary || '',
+    at: Date.now(),
   });
   return finish(null);
 }
@@ -172,47 +259,47 @@ function markerDir() {
 }
 
 /**
- * Claims the completion for one turn and reports whether the caller may notify.
- * `wx` makes the claim atomic, so two hooks racing for the same turn cannot both
- * win.
- *
- * When the turn cannot be identified there is nothing to compare, so the
- * notification is allowed rather than silently suppressed.
+ * @param {string} value
+ * @returns {string}
+ */
+function hash(value) {
+  return createHash('sha1').update(String(value)).digest('hex').slice(0, 16);
+}
+
+/**
+ * What was already sent for a session: the answer it was notified with, and the
+ * `task_complete` summary if one arrived later.
  *
  * @param {string} sessionId
- * @param {string} turnKey what identifies the turn; the caller decides (message id,
- *   whether the turn reported its result, and its text)
- * @returns {boolean}
+ * @returns {{ answer?: string, summary?: string, at?: number }|null}
  */
-function claimCompletion(sessionId, turnKey) {
-  if (!String(turnKey || '').trim()) return true;
+function readSent(sessionId) {
+  try {
+    return JSON.parse(fs.readFileSync(sentFile(sessionId), 'utf8'));
+  } catch {
+    return null;
+  }
+}
 
-  const safe = String(sessionId || '').replace(/[^A-Za-z0-9-]/g, '') || 'unknown-session';
-  const fingerprint = createHash('sha1').update(String(turnKey)).digest('hex').slice(0, 16);
-  const file = path.join(markerDir(), `${safe}.${fingerprint}.done`);
-
+/**
+ * @param {string} sessionId
+ * @param {{ answer: string, summary: string, at: number }} state
+ */
+function writeSent(sessionId, state) {
   try {
     fs.mkdirSync(markerDir(), { recursive: true });
-    fs.writeFileSync(file, String(Date.now()), { flag: 'wx' });
+    fs.writeFileSync(sentFile(sessionId), JSON.stringify(state));
     pruneMarkers();
-    return true;
   } catch (err) {
-    if (err?.code === 'EEXIST') {
-      try {
-        const stamp = Number(fs.readFileSync(file, 'utf8'));
-        if (Date.now() - stamp > STOP_DEDUPE_MS) {
-          fs.writeFileSync(file, String(Date.now()));
-          return true;
-        }
-      } catch {
-        /* unreadable marker: treat as a duplicate */
-      }
-      return false;
-    }
     // A read-only temp dir must not stop the notification.
-    log.debug(`could not record completion for ${sessionId}: ${err.message}`);
-    return true;
+    log.debug(`could not record the completion of ${sessionId}: ${err.message}`);
   }
+}
+
+/** @param {string} sessionId */
+function sentFile(sessionId) {
+  const safe = String(sessionId || '').replace(/[^A-Za-z0-9-]/g, '') || 'unknown-session';
+  return path.join(markerDir(), `${safe}.sent.json`);
 }
 
 /** Keeps the marker directory from growing forever. */

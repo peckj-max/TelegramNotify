@@ -114,10 +114,10 @@ export function isUserEntry(entry) {
  *
  * @param {string|undefined|null} transcriptPath
  * @param {{ maxBytes?: number }} [options]
- * @returns {Promise<{ text: string, id: string, reported: boolean }>}
+ * @returns {Promise<{ text: string, answer: string, summary: string, id: string, reported: boolean }>}
  */
 export async function readLastAssistantMessage(transcriptPath, options = {}) {
-  if (!transcriptPath) return { text: '', id: '', reported: false };
+  if (!transcriptPath) return { text: '', answer: '', summary: '', id: '', reported: false };
   const cap = options.maxBytes ?? MAX_READ_BYTES;
 
   let stat;
@@ -125,9 +125,9 @@ export async function readLastAssistantMessage(transcriptPath, options = {}) {
     stat = await fs.promises.stat(transcriptPath);
   } catch (err) {
     log.debug(`could not stat transcript: ${err.message}`);
-    return { text: '', id: '', reported: false };
+    return { text: '', answer: '', summary: '', id: '', reported: false };
   }
-  if (!stat.isFile() || stat.size === 0) return { text: '', id: '', reported: false };
+  if (!stat.isFile() || stat.size === 0) return { text: '', answer: '', summary: '', id: '', reported: false };
 
   let handle;
   try {
@@ -167,7 +167,7 @@ export async function readLastAssistantMessage(transcriptPath, options = {}) {
   } finally {
     await handle?.close();
   }
-  return { text: '', id: '', reported: false };
+  return { text: '', answer: '', summary: '', id: '', reported: false };
 }
 
 /**
@@ -312,31 +312,31 @@ function answerTextOf(turn, start = 0) {
 /**
  * The assistant text of the turn that ends at `entries`.
  *
- * Only the answer is returned: the trailing block of agent messages that do not come
- * with a tool call, and the `task_complete` summary when the turn has no answer text
- * of its own. Everything before it narrates the work ("let me look at the file"), and
- * a cumulative snapshot of one message is collapsed so the same sentence is not
- * posted twice.
+ * `text` is what a reader should see for the whole turn: the answer, then the
+ * `task_complete` summary under its label. `answer` and `summary` are the two parts on
+ * their own, so a caller can tell what is new when a turn is reported more than once.
  *
  * `reported` says whether the turn ended by reporting its result through
- * `task_complete`; without it the agent host treats the turn as unfinished and
- * nudges it to continue.
+ * `task_complete`; without it the agent host treats the turn as unfinished and nudges it
+ * to continue.
  *
  * @param {any[]} entries
- * @returns {{ text: string, id: string, reported: boolean }}
+ * @returns {{ text: string, answer: string, summary: string, id: string, reported: boolean }}
  */
 export function turnOf(entries) {
-  if (!Array.isArray(entries) || !entries.length) return { text: '', id: '', reported: false };
+  if (!Array.isArray(entries) || !entries.length) {
+    return { text: '', answer: '', summary: '', id: '', reported: false };
+  }
 
   const start = turnStart(entries);
   const turn = entries.slice(start);
-  let text = answerTextOf(turn);
+  let answer = answerTextOf(turn);
 
   // A turn that only reported its result has no answer of its own: the text the
   // reader saw is the previous turn's. That is the turn the host nudged to finish.
-  if (!text && reportedTaskComplete(turn)) {
+  if (!answer && reportedTaskComplete(turn)) {
     const previous = turnStart(entries, start - 1);
-    text = answerTextOf(entries.slice(previous, start));
+    answer = answerTextOf(entries.slice(previous, start));
   }
 
   let id = '';
@@ -348,15 +348,20 @@ export function turnOf(entries) {
   }
 
   const summary = reportedTaskComplete(turn) ? taskSummaryOf(turn) : '';
-  // The answer leads; the summary is merged in only for what it adds, because the
-  // two describe the same work.
-  const answer = mergeAnswerAndSummary(text, summary).trim();
+  // The answer leads; the summary follows under its label, as the panel shows them.
+  const text = mergeAnswerAndSummary(answer, summary).trim();
 
   // A pathological answer is not worth more than the cap; keep its end, where the
   // conclusion is.
-  const capped = answer.length > MAX_TEXT ? `…\n\n${answer.slice(answer.length - MAX_TEXT)}` : answer;
+  const capped = text.length > MAX_TEXT ? `…\n\n${text.slice(text.length - MAX_TEXT)}` : text;
 
-  return { text: capped.trim(), id, reported: reportedTaskComplete(turn) };
+  return {
+    text: capped.trim(),
+    answer: answer.trim(),
+    summary: summary.trim(),
+    id,
+    reported: reportedTaskComplete(turn),
+  };
 }
 
 /**

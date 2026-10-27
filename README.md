@@ -40,33 +40,29 @@ flowchart LR
   closing block of messages that do not come with a tool call is sent; the block
   is kept whole, so a long answer is not cut down to its final "Done." line. When
   the agent host ends the turn with its `task_complete` tool, that tool's summary
-  is the answer. Hosts also log their own system prompt, hook payloads and session
+  is added after the answer under **Task completed:** — immediately when the same
+  turn reports it, or as its own message when the host continues the turn and reports
+  it later. Hosts also log their own system prompt, hook payloads and session
   bookkeeping in the transcript, and those entries are never part of the answer;
   a turn that was interrupted before it answered sends no text rather than its
   last progress line.
 - **Reported once.** Every agent announces the same ending more than once —
   Copilot fires `agentStop` then `sessionEnd`, OpenCode `session.idle` then
   `session.execution.succeeded`, Claude Code `Stop` plus `SubagentStop`/
-  `TaskCompleted`. Each completion is claimed atomically per turn — keyed on the
-  transcript's message id **together with whether the turn reported its result and its
-  text** — so one finish produces one message, while a turn the host stopped twice
-  (once before `task_complete`, once after) is still reported.
+  `TaskCompleted`. The hook remembers what it already sent for a session (the answer
+  and the `task_complete` summary, by fingerprint), so a repeated stop adds nothing.
+- **Sent at once, no waiting window.** A finished turn is posted the moment the hook
+  sees it. The Copilot agent host sometimes stops a turn *before* the agent reports its
+  result, nudges it to continue ("you have not yet marked the task as complete"), and
+  the agent finishes seconds later — the answer is already in the chat, and the
+  `task_complete` summary then arrives as **its own message**, headed *Task completed*.
+  Nothing is held, dropped, or replaced. The host's nudge is not counted as a new
+  turn, so the answer a reader saw is never cut off by it.
 - **The answer, then the panel's `Task completed:` note.** Everything outside the
-  collapsed thinking and tool rows is the answer, and it leads. When the turn reports
-  through `task_complete`, its summary follows under the **Task completed:** label the
-  panel uses — the two are concatenated exactly as the panel shows them, with no
-  comparison and nothing dropped. The only edit is the summary's own lead-in
-  ("Answered the factual question:"), which would otherwise repeat the label.
-- **One message per task, not per turn.** The Copilot agent host stops a turn that
-  ended *without* calling `task_complete`, then nudges it to continue ("you have
-  not yet marked the task as complete") and the agent finishes 10–20 s later. That
-  interim stop is not sent: its notification is held for `completionHoldSeconds`
-  (default **15 s**), dropped when the host continues the session by itself, and
-  replaced if a newer turn of the same session finishes first. A real new prompt in
-  that window sends the held message instead of losing it. Holding happens in the
-  bridge, so the hook is answered at once and the agent's turn never waits. The
-  host's nudge is not counted as a new turn, so the answer a reader saw is never cut
-  off by it.
+  collapsed thinking and tool rows is the answer, and it leads. When the same turn
+  reports through `task_complete` before anyone has read it, its summary follows under
+  the **Task completed:** label the panel uses. The only edit is the summary's own
+  lead-in ("Answered the factual question:"), which would otherwise repeat the label.
 - **Two delivery modes.** Webhook mode registers a URL with Telegram and checks
   `X-Telegram-Bot-Api-Secret-Token` on every call; polling mode needs no public
   host at all. Either way only the configured chat ids are allowed to answer.
@@ -111,7 +107,7 @@ Reload the window. The settings appear under **TelegramNotify** in the Settings 
    - **Enable Notification** — the master switch (on by default);
    - **Bot Token** — from @BotFather;
    - **Chat Id** — the chat that should receive notifications;
-   - **Agents: Copilot / Claude / OpenCode** — the three enable switches;
+   - **Agents: Local / Copilot / OpenCode / Claude** — one enable switch each;
    - **Enable Webhook** — on: serve the webhook on **Webhook Port** and register
      **Public Url**; off: long polling, no nginx or public host needed;
    - **Webhook Secret Token** — leave empty and it is generated on first start.
@@ -135,9 +131,10 @@ run for the bridge; VS Code hosts it.
 | `telegramNotify.notificationsEnabled` | `notificationsEnabled` | `true` |
 | `telegramNotify.botToken` | `botToken` | empty (required) |
 | `telegramNotify.chatId` | `chatId` | empty (required) |
+| `telegramNotify.agents.local` | `agents.local` | `true` |
 | `telegramNotify.agents.copilot` | `agents.copilot` | `true` |
-| `telegramNotify.agents.claude` | `agents.claude` | `true` |
 | `telegramNotify.agents.opencode` | `agents.opencode` | `true` |
+| `telegramNotify.agents.claude` | `agents.claude` | `true` |
 | `telegramNotify.notifyOnCompleted` | `notifyOnCompleted` | `true` |
 | `telegramNotify.notifyOnStart` | `notifyOnStart` | `false` |
 | `telegramNotify.replyTimeoutSeconds` | `replyTimeoutSeconds` | `900` |
@@ -153,7 +150,6 @@ run for the bridge; VS Code hosts it.
 | `telegramNotify.claudeOpenSession` | `claudeOpenSession` | `true` |
 | `telegramNotify.claudeAskWindowSeconds` | `claudeAskWindowSeconds` | `20` |
 | `telegramNotify.panelWaitSeconds` | `panelWaitSeconds` | `20` |
-| `telegramNotify.completionHoldSeconds` | `completionHoldSeconds` | `15` |
 | `telegramNotify.logLevel` | — (editor only) | `info` |
 
 Commands: **Toggle Notifications** (status bar click), **Start/Stop/Restart
@@ -309,9 +305,10 @@ by the tests).
 | `notificationsEnabled` | Master switch. Off means nothing is sent and the bridge does not run. | `true` |
 | `botToken` | Bot token from @BotFather. | — (required) |
 | `chatId` | Chat that receives notifications. One id, a comma-separated list, or an array. Group ids start with `-`. | — (required) |
+| `agents.local` | Enable events from a local agent harness (it runs the same hooks as Copilot, or posts to `/event/local`). | `true` |
 | `agents.copilot` | Enable Copilot events. | `true` |
-| `agents.claude` | Enable Claude Code events. | `true` |
 | `agents.opencode` | Enable OpenCode events. | `true` |
+| `agents.claude` | Enable Claude Code events. | `true` |
 | `notifyOnCompleted` | Send the task-completed notification. | `true` |
 | `notifyOnStart` | Copilot only: announce that a prompt was submitted. | `false` |
 | `replyTimeoutSeconds` | How long a hook waits for an answer before the agent continues. | `900` |
@@ -327,7 +324,6 @@ by the tests).
 | `claudeOpenSession` | Open the Claude Code session a Telegram prompt joins when it runs through Claude Code's own runtime (the fallback path), so the turn is part of the conversation on screen. | `true` |
 | `claudeAskWindowSeconds` | Seconds Claude Code's `AskUserQuestion` waits for an answer in Telegram before its own prompt takes over. `0` means only the panel or terminal asks. | `20` |
 | `panelWaitSeconds` | Seconds a Copilot `permission.requested` or `ask_user` prompt may stay unanswered in the panel before Telegram is told about it. Passive: nothing is decided from the chat. `0` turns the report off. | `20` |
-| `completionHoldSeconds` | Seconds a completion is held when its turn stopped without reporting a result (no `task_complete`). The agent host nudges such a turn to continue; the nudge drops the held message, a newer turn replaces it, and a real new prompt sends it first. `0` sends every completion at once. | `15` |
 
 The keys are grouped the same way the Settings UI shows them: notifications and
 agents first, then the webhook block.
@@ -343,13 +339,12 @@ container:
 | `TELEGRAM_NOTIFY_WEBHOOK_ENABLED` | `webhookEnabled` |
 | `TELEGRAM_NOTIFY_WEBHOOK_PORT` | `webhookPort` |
 | `TELEGRAM_NOTIFY_WEBHOOK_SECRET` | `webhookSecretToken` |
-| `TELEGRAM_NOTIFY_AGENT_COPILOT` / `..._CLAUDE` / `..._OPENCODE` | per-agent switch |
+| `TELEGRAM_NOTIFY_AGENT_LOCAL` / `..._COPILOT` / `..._OPENCODE` / `..._CLAUDE` | per-agent switch |
 | `TELEGRAM_NOTIFY_PUBLIC_URL` | `publicUrl` |
 | `TELEGRAM_NOTIFY_REMOTE_PROMPT` | `remotePromptEnabled` |
 | `TELEGRAM_NOTIFY_CLAUDE_OPEN_SESSION` | `claudeOpenSession` |
 | `TELEGRAM_NOTIFY_CLAUDE_ASK_WINDOW` | `claudeAskWindowSeconds` |
 | `TELEGRAM_NOTIFY_PANEL_WAIT` | `panelWaitSeconds` |
-| `TELEGRAM_NOTIFY_COMPLETION_HOLD` | `completionHoldSeconds` |
 | `TELEGRAM_NOTIFY_ASK_DIR` | folder for the ask markers that stop one request being asked twice (default `%TEMP%\telegram-notify`) |
 | `TELEGRAM_NOTIFY_COPILOT_HOME` | Copilot's state folder, read to learn whether a session is in autopilot or allow-all (default `~/.copilot`) |
 | `TELEGRAM_NOTIFY_NOTIFY_ON_START` | `notifyOnStart` |
@@ -396,6 +391,9 @@ Work in progress is listed whether or not Telegram started it:
   OpenCode sidebar) or its **terminal** is tracked from the event the agent reports
   (Copilot and Claude hooks, the OpenCode session watcher). A prompt the agent host
   writes for itself — the "keep going" nudge — is not a prompt, so it is not listed.
+  Pressing **Stop** in the panel clears the entry too: Copilot writes `abort` and a
+  finished turn writes `assistant.turn_end`, and both are read from its event log,
+  because a stopped turn fires no `agentStop` hook.
 
 `/list` and `/status` show them, and `/cancel <id>` (or `/cancel all`) stops one —
 for a prompt the bridge did not start, that is the agent's own stop/interrupt, so
@@ -606,9 +604,13 @@ log *is* readable, though, and that is what the permission watcher uses.
 
 ## Agent setup
 
+Four agents report to the bridge: **Local**, **Copilot**, **OpenCode** and **Claude
+Code**, each with its own enable switch in Settings.
+
 `install` writes the hook files for the project in the current directory. Pass
 `--project <dir>` for another root, `--global` where a user-level config exists
-(Copilot, Claude Code and OpenCode), and `--agent copilot|claude|opencode|all`.
+(Copilot, Claude Code and OpenCode), and
+`--agent local|copilot|opencode|claude|all`.
 
 The extension also makes sure the **user-level** hooks exist on every start, for
 the agents that are enabled here and installed on this machine (`~/.claude`,
@@ -617,27 +619,33 @@ VS Code or a terminal arrive in Telegram; an unchanged file is not rewritten. Th
 command above is still useful to install into one project only, or into a
 machine that never runs the extension.
 
-### Claude Code
+### Local agent
 
-`install --agent claude` merges into `.claude/settings.json` (or
-`~/.claude/settings.json` with `--global`):
+VS Code's agent picker offers **Local harness**, **Copilot harness** and **Claude
+harness**. Local and Copilot both run the Copilot SDK, and both run these hooks with
+the same command line — so the harness is read from the payload, not from the
+transcript (which is identical in shape):
 
-| Hook | Behaviour |
-| --- | --- |
-| `PreToolUse` (`AskUserQuestion`) | Telegram asks first for `claudeAskWindowSeconds`. A Telegram answer returns as a `permissionDecision: "deny"` reason (free text too; several questions as `a | b`); no answer leaves the question to the interface that shows it. |
-| `Notification` | Reports the prompt Claude Code already shows. A permission notification ("Claude needs your permission to use …") is posted as a permission report with no buttons, so it is answered in the panel or terminal; anything else is posted as an attention message. |
-| `UserPromptSubmit` | Tells the bridge that Claude is the agent in use, so the next Telegram prompt goes to Claude, and records the prompt as a running prompt until `Stop`. Silent unless `notifyOnStart` is on. |
-| `Stop`, `SubagentStop`, `TaskCompleted` | Completion notification. The answer is everything outside the collapsed rows; the `task_complete` summary follows it under the **Task completed:** label, as the panel renders it. |
+| Harness | Payload | Transcript |
+| --- | --- | --- |
+| Local (Copilot Chat's in-process agent) | snake_case: `hook_event_name`, `session_id`, `transcript_path` | `…/workspaceStorage/<ws>/GitHub.copilot-chat/transcripts/<id>.jsonl` |
+| Copilot (the agent host) | camelCase: `sessionId`, `transcriptPath`, `stopReason` | `~/.copilot/session-state/<id>/events.jsonl` |
 
-No `PermissionRequest` hook is installed. It ran before Claude Code decided
-whether to ask, so it also caught calls that would have been approved by the
-session's rules, and an answer there overrode that decision. `install` removes the
-entry an older version left behind.
+A local turn is therefore reported as **Local agent finished** with `<i>local</i>`
+under the heading, listed as `local` in `/list`, and named `local` by `/start`; a
+Copilot turn keeps `Copilot`. Nothing needs installing for the local harness — it
+already runs the same hook config.
 
-Restart Claude Code, or start a new session, so the hooks reload. Hook timeouts
-are written as `replyTimeoutSeconds + 60`; a shorter hook timeout would kill the
-process before the answer arrives. The command pins the Node executable the
-installer resolved, so re-run `install` after moving or upgrading Node.
+A message from Telegram is submitted into the session on screen
+(`workbench.action.chat.open` with `isPartialQuery: false`, no `mode`, so the picker's
+choice is kept), and its answer is read back from the Chat session log exactly like a
+Copilot one.
+
+A harness of your own can report the same way: point its hooks at
+`src/hooks/local-hook.mjs`, or reuse `copilot-hook.mjs` with
+`TELEGRAM_NOTIFY_HOOK_AGENT=local`, or post to `POST /event/local`. `install --agent
+local` prints the block; set `TELEGRAM_NOTIFY_LOCAL_HOOKS` to the harness's hook file to
+have the installer write it.
 
 ### GitHub Copilot
 
@@ -646,6 +654,12 @@ project, or `~/.copilot/hooks/telegram-notify.json` with `--global`. The hook is
 registered for `agentStop` (the end of a turn, which sends the notification),
 `sessionEnd` (registered so the session close is seen and stays silent) and
 `errorOccurred`. **No permission hook is installed.**
+
+`errorOccurred` carries an object (`{ name, message, stack }`), and its message is
+often JSON of its own (`{"message":"…","type":"api_error"}`). The hook reads the
+message out of it, so the chat shows `Cannot have more than 128 tools per request.`
+rather than `[object Object]`, and the failing step is kept as the detail. A host
+that posts an object to `/event` gets the same treatment.
 
 **Why not `permissionRequest`.** That hook runs *before* Copilot's permission
 service (session approvals, allow/deny rules, the prompt), so it is called for
@@ -684,10 +698,10 @@ passed as an argument because the VS Code agent host sends no event field on
 stdin; the hook still accepts Claude-style `hook_event_name` payloads.
 
 `userPromptSubmitted` is installed too: it is silent, and its only job is to tell
-the bridge that Copilot is the agent in use. When the host writes the prompt itself
-(the "you have not yet marked the task as complete" nudge it sends after a turn stops
-early), the event says so: that prompt is not a task, and it drops the notification
-the bridge was holding for the interrupted turn.
+the bridge which agent (and which session) is in use. When the host writes the prompt
+itself (the "you have not yet marked the task as complete" nudge it sends after a turn
+stops early), the event says so: that prompt is not a task, so it starts nothing and
+adds nothing to `/list`.
 
 Hosts that embed Copilot without a hook config can still reach the bridge: post
 the same payload to `POST /event/copilot` from the host's event handler.
@@ -775,6 +789,28 @@ cannot iterate, and `session.hook()` handlers never fired. If an older version l
 a `telegram-notify` plugin entry in `opencode.json`, it is removed on start-up.
 Permissions are therefore answered in the OpenCode UI, not from Telegram: a request
 is announced in the chat, and the OpenCode panel is where it is granted.
+
+### Claude Code
+
+`install --agent claude` merges into `.claude/settings.json` (or
+`~/.claude/settings.json` with `--global`):
+
+| Hook | Behaviour |
+| --- | --- |
+| `PreToolUse` (`AskUserQuestion`) | Telegram asks first for `claudeAskWindowSeconds`. A Telegram answer returns as a `permissionDecision: "deny"` reason (free text too; several questions as `a | b`); no answer leaves the question to the interface that shows it. |
+| `Notification` | Reports the prompt Claude Code already shows. A permission notification ("Claude needs your permission to use …") is posted as a permission report with no buttons, so it is answered in the panel or terminal; anything else is posted as an attention message. |
+| `UserPromptSubmit` | Tells the bridge that Claude is the agent in use, so the next Telegram prompt goes to Claude, and records the prompt as a running prompt until `Stop`. Silent unless `notifyOnStart` is on. |
+| `Stop`, `SubagentStop`, `TaskCompleted` | Completion notification, sent at once. The answer is everything outside the collapsed rows; a `task_complete` summary that arrives later is sent as its own message, headed *Task completed*. |
+
+No `PermissionRequest` hook is installed. It ran before Claude Code decided
+whether to ask, so it also caught calls that would have been approved by the
+session's rules, and an answer there overrode that decision. `install` removes the
+entry an older version left behind.
+
+Restart Claude Code, or start a new session, so the hooks reload. Hook timeouts
+are written as `replyTimeoutSeconds + 60`; a shorter hook timeout would kill the
+process before the answer arrives. The command pins the Node executable the
+installer resolved, so re-run `install` after moving or upgrading Node.
 
 ## HTTP API
 
