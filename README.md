@@ -380,7 +380,10 @@ work:
 - `/cancel <id>` to stop waiting and let the agent continue.
 
 `/list` shows pending requests with the seconds left, `/status` shows the bridge
-state and the enabled agents. After an answer the original message is edited to
+state and the enabled agents. Its `prompt agent` line names the agent a Telegram
+message would go to now, and a turn starting anywhere moves it at once — an
+OpenCode turn in the sidebar makes it `opencode` while that turn is still running,
+not only when the answer arrives. After an answer the original message is edited to
 show what was sent and when, so the chat doubles as a log. Unanswered questions
 expire after `replyTimeoutSeconds` and the agent falls back to its normal prompt.
 With [remote prompts](#prompts-from-telegram) on, anything that is not a command
@@ -419,6 +422,13 @@ of being sent raw. The result follows the editor's own look: what the panel
 highlights, the message highlights — the same files, the same headings, the same
 lists.
 
+Telegram is sent **HTML** (`parse_mode: HTML`), not MarkdownV2. That is the
+format that suits model output: HTML escapes only `&`, `<` and `>`, so a `.`, a
+`-`, a `(` or a `|` in an answer cannot break the message, while MarkdownV2
+requires backslash-escaping eighteen characters and rejects the whole message if
+one is missed. HTML also carries the one formatting agent output needs most — a
+monospace block — which is how a table is drawn.
+
 | Input | Telegram |
 | --- | --- |
 | `# Heading`, `## Heading` | bold and underlined line |
@@ -437,6 +447,18 @@ lists.
 | `---` | a divider |
 | narrow table | aligned monospace block, separator row dropped |
 | wide table | one bullet per row with `column: value` pairs |
+| a table with blank lines between its rows | the same table: the blank lines are stepped over, not read as the end |
+| `\(T\ne mg\)`, `$v_0$` | `T ≠ mg`, `v₀` — inline math, converted to text |
+| `\[ mg-T=ma \tag{1} \]`, `$$…$$` | its own line: `mg-T=ma (1)` |
+
+Telegram has no math renderer, so a formula is converted instead of sent as TeX:
+Greek letters and operators become their Unicode forms (`\alpha` → α, `\ne` → ≠,
+`\times` → ×), a fraction keeps its solidus (`\frac{mg-T}{m}` → `(mg-T)/m`), a
+script becomes a real character where Unicode has one (`v_0` → v₀, `r^2` → r²),
+`\sqrt` becomes √, `\tag{n}` becomes `(n)`, and a wrapper such as `\text`,
+`\mathrm` or `\boxed` is dropped while its contents stay. An unknown command keeps
+its name rather than disappearing, so nothing of the derivation is lost, and math
+inside a fenced block or inline code stays literal.
 
 A URL, a version (`v2.0.22`, `ASP.NET 4.8`) and an API route (`/api/session`) are
 left alone: only text that really is a file or a folder is highlighted.

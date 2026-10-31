@@ -453,10 +453,15 @@ export class Notifier {
   trackRunningPrompt({ agent, prompt, source = 'external', sessionId, startedAt, interrupt } = {}) {
     const session = String(sessionId || '').trim();
     const key = session ? `session:${session}` : '';
+    const name = String(agent || '').trim().toLowerCase();
     if (key) {
       for (const active of this.activePrompts.values()) {
         if (active.key !== key) continue;
         if (prompt) active.prompt = String(prompt);
+        // The turn is already listed, and its agent is the one running it. This is
+        // what moves `/status` the moment a prompt starts, rather than only when
+        // its completion arrives.
+        this.#rememberAgent(active.agent || name);
         return active;
       }
     }
@@ -469,6 +474,12 @@ export class Notifier {
       if (session) twin.sessionId = twin.sessionId || session;
       return twin;
     }
+
+    // An agent starting a turn is the agent in use, so the next Telegram prompt
+    // belongs to it. Without this, `/status` kept naming whatever ran last — a
+    // Copilot or local turn — until the OpenCode turn *completed*, because only a
+    // completion went through `notify()` and remembered its agent.
+    this.#rememberAgent(name);
 
     this.promptSeq += 1;
     const id = newPromptId();

@@ -25,6 +25,194 @@ export function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>]/g, (char) => HTML_ESCAPES[char]);
 }
 
+/** The inverse of escapeHtml, for TeX that was escaped before conversion. */
+function unescapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+/** Letters with their own symbols. */
+const LETTER_COMMANDS = {
+  alpha: 'α', beta: 'β', gamma: 'γ', delta: 'δ', epsilon: 'ε', varepsilon: 'ε',
+  zeta: 'ζ', eta: 'η', theta: 'θ', vartheta: 'ϑ', iota: 'ι', kappa: 'κ',
+  lambda: 'λ', mu: 'μ', nu: 'ν', xi: 'ξ', pi: 'π', rho: 'ρ', sigma: 'σ',
+  tau: 'τ', upsilon: 'υ', phi: 'φ', varphi: 'φ', chi: 'χ', psi: 'ψ', omega: 'ω',
+  Gamma: 'Γ', Delta: 'Δ', Theta: 'Θ', Lambda: 'Λ', Xi: 'Ξ', Pi: 'Π', Sigma: 'Σ',
+  Upsilon: 'Υ', Phi: 'Φ', Psi: 'Ψ', Omega: 'Ω',
+  times: '×', cdot: '·', div: '÷', pm: '±', mp: '∓', ast: '∗', star: '⋆',
+  ne: '≠', neq: '≠', le: '≤', leq: '≤', ge: '≥', geq: '≥', ll: '≪', gg: '≫',
+  approx: '≈', simeq: '≃', equiv: '≡', sim: '∼', propto: '∝', cong: '≅',
+  infty: '∞', partial: '∂', nabla: '∇', sum: 'Σ', prod: 'Π', int: '∫',
+  iint: '∬', oint: '∮', to: '→', rightarrow: '→', leftarrow: '←',
+  Rightarrow: '⇒', Leftarrow: '⇐', leftrightarrow: '↔', Leftrightarrow: '⇔',
+  rightleftharpoons: '⇌', uparrow: '↑', downarrow: '↓', mapsto: '↦',
+  degree: '°', circ: '∘', angle: '∠', perp: '⊥', parallel: '∥',
+  in: '∈', notin: '∉', ni: '∋', subset: '⊂', subseteq: '⊆', supset: '⊃',
+  supseteq: '⊇', cup: '∪', cap: '∩', emptyset: '∅', varnothing: '∅',
+  forall: '∀', exists: '∃', neg: '¬', land: '∧', lor: '∨',
+  therefore: '∴', because: '∵', ldots: '…', cdots: '⋯', dots: '…',
+  prime: '′', hbar: 'ℏ', ell: 'ℓ', Re: 'ℜ', Im: 'ℑ', aleph: 'ℵ',
+  triangle: '△', square: '□', surd: '√', checkmark: '✓', bigcirc: '○',
+  vert: '|', lvert: '|', rvert: '|', mid: '|',
+};
+
+/** Commands whose name is the text to show (`\sin x` reads "sin x"). */
+const FUNCTION_COMMANDS = new Set([
+  'sin', 'cos', 'tan', 'cot', 'sec', 'csc', 'arcsin', 'arccos', 'arctan',
+  'sinh', 'cosh', 'tanh', 'log', 'ln', 'lg', 'exp', 'lim', 'max', 'min',
+  'sup', 'inf', 'det', 'gcd', 'mod', 'bmod', 'deg', 'dim', 'ker', 'Pr',
+]);
+
+const SUPERSCRIPT = {
+  0: '⁰', 1: '¹', 2: '²', 3: '³', 4: '⁴', 5: '⁵', 6: '⁶', 7: '⁷', 8: '⁸', 9: '⁹',
+  '+': '⁺', '-': '⁻', '=': '⁼', '(': '⁽', ')': '⁾', n: 'ⁿ', i: 'ⁱ', x: 'ˣ',
+  a: 'ᵃ', b: 'ᵇ', c: 'ᶜ', d: 'ᵈ', e: 'ᵉ', f: 'ᶠ', g: 'ᵍ', h: 'ʰ', j: 'ʲ', k: 'ᵏ',
+  l: 'ˡ', m: 'ᵐ', o: 'ᵒ', p: 'ᵖ', r: 'ʳ', s: 'ˢ', t: 'ᵗ', u: 'ᵘ', v: 'ᵛ', w: 'ʷ',
+  y: 'ʸ', z: 'ᶻ',
+};
+
+const SUBSCRIPT = {
+  0: '₀', 1: '₁', 2: '₂', 3: '₃', 4: '₄', 5: '₅', 6: '₆', 7: '₇', 8: '₈', 9: '₉',
+  '+': '₊', '-': '₋', '=': '₌', '(': '₍', ')': '₎', a: 'ₐ', e: 'ₑ', o: 'ₒ',
+  x: 'ₓ', h: 'ₕ', k: 'ₖ', l: 'ₗ', m: 'ₘ', n: 'ₙ', p: 'ₚ', s: 'ₛ', t: 'ₜ',
+  i: 'ᵢ', j: 'ⱼ', r: 'ᵣ', u: 'ᵤ', v: 'ᵥ',
+};
+
+/** A script run, or null when a character has no Unicode form. */
+function toScript(body, map) {
+  let out = '';
+  for (const char of String(body ?? '')) {
+    if (!Object.prototype.hasOwnProperty.call(map, char)) return null;
+    out += map[char];
+  }
+  return out || null;
+}
+
+/**
+ * Every known command name, longest first.
+ *
+ * The order matters twice: `\varepsilon` must win over `\varepsilon`'s prefix
+ * `\varepsilon`… and, as a prefix match, `\cdot` must still be found in
+ * `\cdotm` — which is what `\cdot\text{m}` becomes once the wrapper is unwrapped.
+ * TeX would call `\cdotm` an unknown command; the intent here is plain.
+ */
+const SYMBOL_COMMANDS = new RegExp(
+  `\\\\(?:${Object.keys(LETTER_COMMANDS)
+    .sort((a, b) => b.length - a.length)
+    .join('|')})`,
+  'g',
+);
+
+/** One side of a fraction: bracketed only when it is compound. */
+function fractionPart(value) {
+  const body = String(value ?? '').trim();
+  if (!body) return '';
+  // Brackets are needed to keep the meaning (`mg-T` over `m`), not for their own
+  // sake: a solidus between two atoms already reads unambiguously.
+  return /[+\-=,;\s]/.test(body) ? `(${body})` : body;
+}
+
+/**
+ * Inline math in a plain-text cell, where there is no HTML to hold a marker.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function mathToText(text) {
+  return String(text ?? '')
+    .replace(/\\\(([\s\S]+?)\\\)/g, (whole, tex) => latexToText(tex))
+    .replace(/\\\[([\s\S]+?)\\\]/g, (whole, tex) => latexToText(tex))
+    .replace(/\$\$([\s\S]+?)\$\$/g, (whole, tex) => latexToText(tex))
+    .replace(/(^|[^\\$])\$([^\s$](?:[^$\n]*[^\s$])?)\$(?![\d])/g, (whole, pre, tex) => pre + latexToText(tex));
+}
+
+/**
+ * LaTeX as readable plain text.
+ *
+ * Telegram has no math renderer and no table element, so a formula has to become
+ * characters: Greek letters and operators get their Unicode forms, a fraction
+ * keeps its solidus, and a tag becomes a bracketed number. Anything unknown loses
+ * only its backslash, so nothing of the formula disappears.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+export function latexToText(value) {
+  let text = String(value ?? '');
+  if (!text.trim()) return '';
+
+  // A line break inside a formula, and the rows of an environment.
+  text = text.replace(/\\\\/g, '\n').replace(/\\(?:begin|end)\s*\{[^{}]*\}/g, '\n');
+
+  // Commands taking braced arguments, innermost first: the loop is what lets
+  // `\frac{\sqrt{2}}{2}` collapse, one nesting level per pass.
+  for (let pass = 0; pass < 5; pass += 1) {
+    const before = text;
+    text = text
+      .replace(/\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, (whole, a, b) => `${fractionPart(a)}/${fractionPart(b)}`)
+      .replace(/\\sqrt\s*(?:\[([^\]]*)\])?\s*\{([^{}]*)\}/g, (whole, index, body) =>
+        (index === '3' ? '∛' : '√') + `(${body.trim()})`,
+      )
+      .replace(/\\tag\s*\*?\s*\{([^{}]*)\}/g, (whole, body) => `(${body.trim()})`)
+      .replace(/\\(?:colorbox|textcolor)\s*\{[^{}]*\}\s*\{([^{}]*)\}/g, (whole, body) => body)
+      .replace(/\\(?:color|highlight)\s*\{[^{}]*\}/g, '')
+      .replace(/\\(?:stackrel|overset|underset)\s*\{[^{}]*\}\s*\{([^{}]*)\}/g, (whole, body) => body)
+      .replace(/\\(?:text|textrm|textbf|textit|mbox|operatorname)\s*\{([^{}]*)\}/g, (whole, body) => body)
+      .replace(
+        /\\(?:mathrm|mathbf|mathit|mathsf|mathtt|mathcal|mathbb|mathfrak|boldsymbol|bm|vec|bar|hat|tilde|dot|ddot|overline|underline|widehat|widetilde|boxed|fbox|mathop|mathbin|mathrel|mathord|mathopen|mathclose|mathpunct|cancel|bcancel|xcancel|substack|phantom|smash)\s*\{([^{}]*)\}/g,
+        (whole, body) => body,
+      );
+    if (text === before) break;
+  }
+
+  // Superscripts and subscripts become real characters where Unicode has them.
+  text = text.replace(/\^\{([^{}]*)\}|\^([A-Za-z0-9+-])/g, (whole, braced, single) => {
+    const body = braced !== undefined ? braced : single;
+    return toScript(body, SUPERSCRIPT) ?? (body.length > 1 ? `^(${body})` : `^${body}`);
+  });
+  text = text.replace(/_\{([^{}]*)\}|_([A-Za-z0-9+-])/g, (whole, braced, single) => {
+    const body = braced !== undefined ? braced : single;
+    return toScript(body, SUBSCRIPT) ?? (body.length > 1 ? `_(${body})` : `_${body}`);
+  });
+
+  text = text
+    // Spacing and sizing commands carry no meaning in plain text. Only a
+    // backslash followed by one of these characters is a command; a bare word is
+    // left alone.
+    .replace(/\\[,;:!>]/g, ' ')
+    .replace(/\\ /g, ' ')
+    .replace(/\\(?:quad|qquad)\b/g, '  ')
+    .replace(/\\(?:left|right|big|Big|bigg|Bigg|bigl|bigr|Bigl|Bigr|middle)\b\s?/g, '')
+    .replace(/\\(?:displaystyle|textstyle|scriptstyle|limits|nolimits)\b\s?/g, '');
+
+  // Named symbols first, matched as a prefix so unwrapped groups cannot hide
+  // one; then function names; then anything left keeps its name without the
+  // backslash rather than disappearing.
+  text = text
+    .replace(SYMBOL_COMMANDS, (whole) => LETTER_COMMANDS[whole.slice(1)])
+    .replace(/\\([A-Za-z]+)/g, (whole, name) => (FUNCTION_COMMANDS.has(name) ? name : name));
+
+  // An escaped character is that character.
+  text = text.replace(/\\([{}$%&#_|])/g, '$1');
+  text = text.replace(/[{}]/g, '');
+  // An alignment tab separates parts of one row.
+  text = text.replace(/&/g, ' ');
+  // A binary operator reads better spaced on both sides than on one: `5.0\times
+  // 9.8` otherwise reaches the chat as `5.0× 9.8`.
+  text = text.replace(/\s*([×÷±∓∗≈≤≥≠≡])\s*/g, ' $1 ');
+
+  return text
+    .split('\n')
+    .map((line) => line.replace(/[ \t]{2,}/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
 /**
  * A path an agent writes when it means "this file": a Windows drive path, a POSIX
  * path, a `./`-relative one, or a relative `folder/file.ext`, optionally with a
@@ -72,6 +260,7 @@ function fileLabel(path) {
  */
 function inlineMarkdown(line) {
   const codeSpans = [];
+  const mathSpans = [];
   // Inline code is extracted first so its contents are never reformatted.
   let text = line.replace(/`([^`\n]+)`/g, (_, code) => {
     codeSpans.push(code);
@@ -92,6 +281,21 @@ function inlineMarkdown(line) {
     return `<code>${shown}${named && line ? `:${line}` : ''}</code>`;
   });
 
+  // Math is taken next, while code spans and links are already set aside: the
+  // TeX must never meet the emphasis rules below, where `a*b*c` and `x_1` mean
+  // something else. Telegram cannot typeset it, so it becomes readable text.
+  const holdMath = (tex) => {
+    mathSpans.push(escapeHtml(latexToText(unescapeHtml(tex))));
+    return `\u0001${mathSpans.length - 1}\u0001`;
+  };
+  text = text.replace(/\\\(([\s\S]+?)\\\)/g, (whole, tex) => holdMath(tex));
+  text = text.replace(/\\\[([\s\S]+?)\\\]/g, (whole, tex) => holdMath(tex));
+  text = text.replace(/\$\$/g, '\u0003');
+  text = text.replace(/\u0003([\s\S]+?)\u0003/g, (whole, tex) => holdMath(tex));
+  // A `$…$` pair, guarded so a price is not treated as a formula: the content may
+  // not start or end with a space, and a closing `$` followed by a digit is money.
+  text = text.replace(/(^|[^\\$])\$([^\s$](?:[^$\n]*[^\s$])?)\$(?![\d])/g, (whole, pre, tex) => pre + holdMath(tex));
+
   text = text
     .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
     .replace(/__([^_\n]+)__/g, '<b>$1</b>')
@@ -101,8 +305,14 @@ function inlineMarkdown(line) {
 
   text = text.replace(/\u0000(\d+)\u0000/g, (_, index) => `<code>${codeSpans[Number(index)]}</code>`);
 
-  return highlightPaths(text);
+  // An unpaired `$$` marker left over: it was a dollar sign, not a formula.
+  text = text.replace(/\u0003/g, '$');
+
+  // Formulas are expanded last: they are literal text, so a fraction's solidus is
+  // never read as a path and a stray `*` is never read as emphasis.
+  return highlightPaths(text).replace(/\u0001(\d+)\u0001/g, (_, index) => mathSpans[Number(index)]);
 }
+
 
 /**
  * Highlights a path the agent wrote as plain text, the same way a link to a file is
@@ -142,8 +352,12 @@ function isSeparatorRow(line) {
 function looksLikeTableStart(lines, index) {
   const line = lines[index];
   if (!line || !line.includes('|')) return false;
-  const next = lines[index + 1];
-  return Boolean(next && isSeparatorRow(next) && next.includes('|'));
+  // A model often leaves a blank line under the header, so the separator row is
+  // looked for past any run of blank lines rather than only on the next line.
+  let next = index + 1;
+  while (next < lines.length && !String(lines[next]).trim()) next += 1;
+  const divider = lines[next];
+  return Boolean(divider && isSeparatorRow(divider) && divider.includes('|'));
 }
 
 function splitRow(line) {
@@ -152,7 +366,9 @@ function splitRow(line) {
     .replace(/^\|/, '')
     .replace(/\|$/, '')
     .split('|')
-    .map((cell) => cell.trim());
+    // A cell that holds a formula is converted here: the narrow layout prints
+    // cells as plain monospace text, with no further markup pass.
+    .map((cell) => mathToText(cell.trim()));
 }
 
 /**
@@ -216,10 +432,25 @@ function renderTable(header, rows) {
 function readTable(lines, start) {
   const header = splitRow(lines[start]);
   const rows = [];
-  let index = start + 2;
+  // Past the (possibly blank-separated) separator row.
+  let index = start + 1;
+  while (index < lines.length && !String(lines[index]).trim()) index += 1;
+  index += 1;
   while (index < lines.length) {
-    const line = lines[index];
-    if (!line.trim() || !line.includes('|')) break;
+    const line = String(lines[index]);
+    if (!line.trim()) {
+      // Blank lines inside a table are tolerated — models separate rows that way,
+      // and reading them as the end leaves the pipes showing as text. A blank line
+      // only ends the table when no row follows it.
+      let peek = index + 1;
+      while (peek < lines.length && !String(lines[peek]).trim()) peek += 1;
+      if (peek < lines.length && String(lines[peek]).includes('|')) {
+        index = peek;
+        continue;
+      }
+      break;
+    }
+    if (!line.includes('|')) break;
     if (isSeparatorRow(line)) {
       index += 1;
       continue;
@@ -230,6 +461,37 @@ function readTable(lines, start) {
     index += 1;
   }
   return { html: renderTable(header, rows), next: index };
+}
+
+/**
+ * A display formula starting at `start`, or null when one does not.
+ *
+ * `$$…$$` and `\[…\]` may span lines, and their contents can hold `|`, `*` or
+ * `_`, which the table and emphasis rules would otherwise claim. A formula that is
+ * never closed — a truncated answer — is not read at all, so nothing is lost.
+ *
+ * @param {string[]} lines
+ * @param {number} start
+ * @returns {{tex: string, next: number}|null}
+ */
+function readDisplayMath(lines, start) {
+  const opened = /^\s*(\\\[|\$\$)/.exec(String(lines[start] ?? ''));
+  if (!opened) return null;
+  const closer = opened[1] === '\\[' ? '\\]' : '$$';
+  const body = String(lines[start]).replace(/^\s*/, '').slice(opened[1].length);
+  const sameLine = body.indexOf(closer);
+  if (sameLine >= 0) return { tex: body.slice(0, sameLine), next: start + 1 };
+
+  const parts = [body];
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const at = String(lines[index]).indexOf(closer);
+    if (at >= 0) {
+      parts.push(String(lines[index]).slice(0, at));
+      return { tex: parts.join('\n'), next: index + 1 };
+    }
+    parts.push(String(lines[index]));
+  }
+  return null;
 }
 
 /**
@@ -268,6 +530,16 @@ export function markdownToTelegramHtml(value) {
       const { html, next } = readTable(lines, index);
       blocks.push(html);
       index = next;
+      continue;
+    }
+
+    // A formula on its own lines is one block. Telegram would show the raw TeX,
+    // so it is converted to text and kept on its own line, as the session draws it.
+    const display = readDisplayMath(lines, index);
+    if (display) {
+      const formula = escapeHtml(latexToText(display.tex));
+      if (formula) blocks.push(formula);
+      index = display.next;
       continue;
     }
 
