@@ -1363,6 +1363,7 @@ const NATURAL_SUFFIX = new Set([
   'continued the task on its own',
   'needs your answer',
   'task completed',
+  'done',
   'answered',
 ]);
 

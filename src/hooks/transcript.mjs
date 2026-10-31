@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { answerOf, isToolPart, mergeAnswerAndSummary } from '../answer.mjs';
+import { answerOf, doneLabelOf, isToolPart, mergeAnswerAndSummary } from '../answer.mjs';
 import { log } from '../logger.mjs';
 
 /** Windows to try, smallest first: most turns finish inside the first one. */
@@ -72,6 +72,60 @@ export function hasToolWorkOf(entry) {
 }
 
 /**
+ * The tool calls a message asked for, in either schema.
+ *
+ * @param {any} entry
+ * @returns {any[]}
+ */
+function toolRequestsOf(entry) {
+  return [entry?.data?.toolRequests, entry?.toolRequests].filter(Array.isArray).flat();
+}
+
+/**
+ * Whether a tool name is the agent reporting its result rather than working. Both
+ * harnesses spell it with either separator.
+ *
+ * @param {unknown} name
+ * @returns {boolean}
+ */
+function isTaskCompleteName(name) {
+  return /task[_-]?complete/i.test(String(name ?? ''));
+}
+
+/**
+ * Whether an entry is the session-level mirror of a `task_complete` call. The Copilot
+ * agent host writes it, and the local harness writes the same event for its own turns.
+ *
+ * @param {any} entry
+ * @returns {boolean}
+ */
+function isTaskCompleteEvent(entry) {
+  return /^session\.task[_-]?complete/i.test(String(entry?.type ?? ''));
+}
+
+/**
+ * The arguments of a tool call.
+ *
+ * The Copilot agent host writes them as an object, while the local harness asks for
+ * the same call with a JSON *string* (the wire format of a tool call). Reading only
+ * the object form made the local harness look like a turn that never reported a
+ * summary.
+ *
+ * @param {any} request
+ * @returns {any}
+ */
+function toolArgumentsOf(request) {
+  const args = request?.arguments ?? request?.args ?? {};
+  if (typeof args !== 'string') return args && typeof args === 'object' ? args : {};
+  try {
+    const parsed = JSON.parse(args);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
  * Whether an entry is something the user typed, which starts a new turn.
  * Both schemas report it, and a tool result also arrives as a `user` entry in
  * Claude's format, so only real prompt text counts. A prompt the agent host writes
@@ -113,7 +167,8 @@ export function isUserEntry(entry) {
  * answer, while the narration before the tool calls is left out entirely.
  *
  * @param {string|undefined|null} transcriptPath
- * @param {{ maxBytes?: number }} [options]
+ * @param {{ maxBytes?: number, agent?: string }} [options] `agent` names the
+ *   harness in the closing `done` note (`Copilot`, `Local agent`, …)
  * @returns {Promise<{ text: string, answer: string, summary: string, id: string, reported: boolean }>}
  */
 export async function readLastAssistantMessage(transcriptPath, options = {}) {
@@ -153,7 +208,7 @@ export async function readLastAssistantMessage(transcriptPath, options = {}) {
         }
       }
 
-      const turn = turnOf(entries);
+      const turn = turnOf(entries, { agent: options.agent });
       // A turn that started before the window would be reported with only part of
       // its text, which is the "answer is a small portion" bug: widen the window
       // until the prompt that opens the turn is inside it.
@@ -211,10 +266,9 @@ export function isSystemPromptOf(prompt) {
 /**
  * Whether the turn ended by reporting its result through `task_complete`.
  *
- * The agent host nudges a turn that ends without it ("you have not yet marked the
- * task as complete"), so such a turn is not the end of the work even though the
- * host stopped it. The bridge holds that notification briefly instead of posting an
- * interim answer.
+ * The report is optional: a turn that never makes the call is finished all the same,
+ * and its answer is sent at once. The report only decides whether a `done` note is
+ * added, and whether a later stop has a summary to send on its own.
  *
  * @param {any[]} entries
  * @returns {boolean}
@@ -222,10 +276,9 @@ export function isSystemPromptOf(prompt) {
 export function reportedTaskComplete(entries) {
   if (!Array.isArray(entries)) return false;
   for (const entry of entries) {
-    if (String(entry?.type ?? '') === 'session.task_complete') return true;
+    if (isTaskCompleteEvent(entry)) return true;
     if (!isAssistantEntry(entry)) continue;
-    const requests = [entry?.data?.toolRequests, entry?.toolRequests].filter(Array.isArray).flat();
-    if (requests.some((request) => /task[_-]?complete/i.test(String(request?.name ?? '')))) return true;
+    if (toolRequestsOf(entry).some((request) => isTaskCompleteName(request?.name))) return true;
   }
   return false;
 }
@@ -245,16 +298,16 @@ export function taskSummaryOf(entries) {
 
   let summary = '';
   for (const entry of entries) {
-    if (String(entry?.type ?? '') === 'session.task_complete') {
+    if (isTaskCompleteEvent(entry)) {
       const value = String(entry?.data?.summary ?? entry?.summary ?? '').trim();
       if (value) summary = value;
       continue;
     }
     if (!isAssistantEntry(entry)) continue;
-    const requests = [entry?.data?.toolRequests, entry?.toolRequests].filter(Array.isArray).flat();
-    for (const request of requests) {
-      if (!/task[_-]?complete/i.test(String(request?.name ?? ''))) continue;
-      const args = request?.arguments ?? request?.args ?? {};
+    for (const request of toolRequestsOf(entry)) {
+      if (!isTaskCompleteName(request?.name)) continue;
+      // The local harness sends the arguments as a JSON string.
+      const args = toolArgumentsOf(request);
       const value = String(args.summary ?? args.message ?? '').trim();
       if (value) summary = value;
     }
@@ -263,78 +316,127 @@ export function taskSummaryOf(entries) {
 }
 
 /**
- * Whether an entry is the agent reporting its result rather than working: the
- * `task_complete` call and the session event that mirrors it. They come *after* the
- * answer, so they must not hide it.
+ * The items of one turn in transcript order, and where the turn reported its result.
  *
- * @param {any} entry
- * @returns {boolean}
+ * A message whose only tool call is `task_complete` is the report, and so is the tool
+ * log that runs it and the session event that mirrors it: they are collapsed rows in
+ * the panel, not steps of the work. The local harness writes the answer *in* the
+ * message that carries the call, and then one more short closing note, so ending the
+ * answer block at the report left only that note — the reason the two harnesses posted
+ * different messages.
+ *
+ * @param {any[]} turn
+ * @returns {{ items: import('../answer.mjs').AnswerItem[], reportIndex: number }}
  */
-function isReportStep(entry) {
-  if (String(entry?.type ?? '') === 'session.task_complete') return true;
-  if (!isAssistantEntry(entry)) return false;
-  if (assistantTextOf(entry)) return false;
-  const requests = [entry?.data?.toolRequests, entry?.toolRequests].filter(Array.isArray).flat();
-  return requests.length > 0 && requests.every((request) => /task[_-]?complete/i.test(String(request?.name ?? '')));
+function turnItems(turn) {
+  const items = [];
+  /** @type {Map<string, string>} names of the calls, so a log knows what it ran */
+  const toolNames = new Map();
+  let reportIndex = -1;
+
+  for (const entry of turn) {
+    for (const request of toolRequestsOf(entry)) {
+      if (request?.toolCallId) toolNames.set(String(request.toolCallId), String(request.name ?? ''));
+    }
+    const callId = String(entry?.data?.toolCallId ?? entry?.toolCallId ?? '');
+    const loggedName = String(entry?.data?.toolName ?? '');
+    if (loggedName && callId) toolNames.set(callId, loggedName);
+
+    if (isTaskCompleteEvent(entry)) {
+      reportIndex = items.length;
+      items.push({ text: '', toolWork: false, report: true });
+      continue;
+    }
+    if (isAssistantEntry(entry)) {
+      const requests = toolRequestsOf(entry);
+      const report = requests.length > 0 && requests.every((request) => isTaskCompleteName(request?.name));
+      if (report) reportIndex = items.length;
+      items.push({
+        text: assistantTextOf(entry),
+        toolWork: hasToolWorkOf(entry),
+        step: !report,
+        report,
+      });
+      continue;
+    }
+    if (hasToolWorkOf(entry)) {
+      // A tool result or execution log still marks where the last step ended, unless
+      // the call it ran was the report itself.
+      const report = isTaskCompleteName(loggedName || toolNames.get(callId));
+      if (report) reportIndex = items.length;
+      items.push({ text: '', toolWork: true, report });
+    }
+  }
+
+  return { items, reportIndex };
 }
 
 /**
- * The text of the turn that ends at `entries`.
- *
- * The answer is what the panel shows outside the collapsed thinking and tool rows:
- * the trailing block of assistant messages that do not come with a tool call. The
- * `task_complete` summary is only a fallback, because it paraphrases that answer and
- * often opens with a meta remark ("Answered the factual question: …") that the
- * reader does not need.
+ * The text the reader can see outside the collapsed rows.
  *
  * @param {any[]} turn entries of one turn
  * @param {number} [start] index in `turn` where the answer may begin
  * @returns {string}
  */
 function answerTextOf(turn, start = 0) {
-  const items = [];
-  for (const entry of turn.slice(start)) {
-    if (isAssistantEntry(entry)) {
-      items.push({
-        text: assistantTextOf(entry),
-        toolWork: hasToolWorkOf(entry),
-        // Reporting the result is not a step of the work: it must not end the block.
-        step: !isReportStep(entry),
-      });
-    } else if (hasToolWorkOf(entry)) {
-      // A tool result or execution log still marks where the last step ended.
-      items.push({ text: '', toolWork: true });
-    }
+  return answerOf(turnItems(turn.slice(start)).items);
+}
+
+/**
+ * The short note the local harness writes after the `task_complete` row. It reads as
+ * the harness's own summary of the answer ("Answered above — …"), so when the agent
+ * reported no summary of its own this one is used *instead of* counting the note as
+ * more answer text — which would otherwise post the same thing twice.
+ *
+ * @param {import('../answer.mjs').AnswerItem[]} items
+ * @param {number} reportIndex
+ * @returns {string}
+ */
+function closingTextOf(items, reportIndex) {
+  if (reportIndex < 0) return '';
+  for (let index = items.length - 1; index > reportIndex; index -= 1) {
+    const item = items[index] ?? {};
+    if (item.report || item.toolWork) continue;
+    const text = String(item.text ?? '').trim();
+    if (text) return text;
   }
-  return answerOf(items);
+  return '';
 }
 
 /**
  * The assistant text of the turn that ends at `entries`.
  *
  * `text` is what a reader should see for the whole turn: the answer, then the
- * `task_complete` summary under its label. `answer` and `summary` are the two parts on
- * their own, so a caller can tell what is new when a turn is reported more than once.
+ * `task_complete` summary under its `done` label. `answer` and `summary` are the two
+ * parts on their own, so a caller can tell what is new when a turn is reported more
+ * than once — the answer is sent as soon as it exists, and the summary follows on its
+ * own if the agent reports it later.
  *
  * `reported` says whether the turn ended by reporting its result through
- * `task_complete`; without it the agent host treats the turn as unfinished and nudges it
- * to continue.
+ * `task_complete`; a turn that never reports one is complete all the same, so its
+ * answer is not held back waiting for it.
  *
  * @param {any[]} entries
+ * @param {{ agent?: string }} [options] the harness, named in the `done` label
  * @returns {{ text: string, answer: string, summary: string, id: string, reported: boolean }}
  */
-export function turnOf(entries) {
+export function turnOf(entries, options = {}) {
   if (!Array.isArray(entries) || !entries.length) {
     return { text: '', answer: '', summary: '', id: '', reported: false };
   }
 
   const start = turnStart(entries);
   const turn = entries.slice(start);
-  let answer = answerTextOf(turn);
+  const { items, reportIndex } = turnItems(turn);
+  const reported = reportedTaskComplete(turn);
+
+  // The whole last section up to the report: every visible message, with the
+  // collapsed tool and `task_complete` rows passed over.
+  let answer = answerOf(reportIndex >= 0 ? items.slice(0, reportIndex + 1) : items);
 
   // A turn that only reported its result has no answer of its own: the text the
   // reader saw is the previous turn's. That is the turn the host nudged to finish.
-  if (!answer && reportedTaskComplete(turn)) {
+  if (!answer && reported) {
     const previous = turnStart(entries, start - 1);
     answer = answerTextOf(entries.slice(previous, start));
   }
@@ -347,9 +449,11 @@ export function turnOf(entries) {
     break;
   }
 
-  const summary = reportedTaskComplete(turn) ? taskSummaryOf(turn) : '';
-  // The answer leads; the summary follows under its label, as the panel shows them.
-  const text = mergeAnswerAndSummary(answer, summary).trim();
+  // The reported result, else the harness's own closing note: either way it is the
+  // `done` note, never a replacement for the answer.
+  const summary = reported ? taskSummaryOf(turn) || closingTextOf(items, reportIndex) : '';
+  // The answer leads; the summary follows under the label, as the panel shows them.
+  const text = mergeAnswerAndSummary(answer, summary, doneLabelOf(options.agent)).trim();
 
   // A pathological answer is not worth more than the cap; keep its end, where the
   // conclusion is.
@@ -360,7 +464,7 @@ export function turnOf(entries) {
     answer: answer.trim(),
     summary: summary.trim(),
     id,
-    reported: reportedTaskComplete(turn),
+    reported,
   };
 }
 

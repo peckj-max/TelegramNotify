@@ -4,9 +4,9 @@
  * A turn is a loop: a line of narration, a tool call, another line, another tool
  * call, and then the answer. Everything before the answer is progress reporting
  * ("let me look at the file"), which the recipient of a Telegram message does not
- * want. The answer is therefore the trailing block of messages that do not
- * accompany tool work — that block is complete, so a long answer is not cut down
- * to its closing line.
+ * want. The answer is therefore the last section's visible messages — those that sit
+ * outside the collapsed tool and `task_complete` rows — and that block is kept whole,
+ * so a long answer is not cut down to its closing line.
  */
 
 /**
@@ -14,6 +14,8 @@
  * @property {string} [text] what the agent wrote in this message
  * @property {boolean} [toolWork] the message came with a tool call
  * @property {boolean} [step] the item is a model message, not a bare tool log
+ * @property {boolean} [report] the item is the turn reporting its own result
+ *   (`task_complete`), which the panel shows collapsed
  */
 
 /**
@@ -29,6 +31,15 @@ export function answerOf(items) {
     const text = String(item.text ?? '').trim();
 
     if (item.toolWork) {
+      // Reporting the result is a collapsed row, not a step of the work: the text
+      // that came with it is part of the answer, and it must not end the block.
+      // The local harness writes its answer and its `task_complete` call in the
+      // same message, so ending the block here would leave only the short closing
+      // note that follows as the answer.
+      if (item.report) {
+        if (text) answer.unshift(text);
+        continue;
+      }
       // The block that was collected so far is the answer; this is the step that
       // came before it.
       if (answer.length) break;
@@ -94,9 +105,30 @@ export function withoutLeadIn(summary) {
   return rest.trim();
 }
 
+/** How each agent is named in the closing "done" note. */
+const AGENT_NAMES = {
+  copilot: 'Copilot',
+  local: 'Local agent',
+  claude: 'Claude Code',
+  opencode: 'OpenCode',
+};
+
+/**
+ * The bold label that introduces the agent's own `task_complete` summary, the way
+ * the panel marks the finished task: `Copilot done:`. A local harness's turns are
+ * labelled `Local agent done:` so the note always names the agent that reported.
+ *
+ * @param {string} [agent]
+ * @returns {string}
+ */
+export function doneLabelOf(agent) {
+  const name = AGENT_NAMES[String(agent ?? '').trim().toLowerCase()] || AGENT_NAMES.copilot;
+  return `**${name} done:**`;
+}
+
 /**
  * Puts the summary the host reported after the answer, the way the panel renders it:
- * the answer, then `Task completed:`, then the summary.
+ * the answer, then `Copilot done:`, then the summary.
  *
  * The answer is everything outside the collapsed rows, so it leads with its own
  * formatting; the summary follows as the host wrote it. Both are sent, because the
@@ -104,12 +136,12 @@ export function withoutLeadIn(summary) {
  *
  * @param {string} answer
  * @param {string} summary
+ * @param {string} [label] the `done` label, when the agent is already known
  * @returns {string}
  */
-export function mergeAnswerAndSummary(answer, summary) {
+export function mergeAnswerAndSummary(answer, summary, label = doneLabelOf('copilot')) {
   const body = String(answer ?? '').trim();
   const report = withoutLeadIn(summary).trim();
-  const label = '**Task completed:**';
   if (!report) return body;
   if (!body) return `${label}\n\n${report}`;
   return `${body}\n\n${label}\n\n${report}`;

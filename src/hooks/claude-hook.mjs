@@ -208,7 +208,7 @@ async function handleCompleted(eventName, input) {
     hint: input.transcript_path || input.transcriptPath,
     sessionId: input.session_id || input.sessionId,
   });
-  const found = await readLastAssistantMessage(transcript);
+  const found = await readLastAssistantMessage(transcript, { agent: 'claude' });
 
   // Claude Code can report the same ending twice (Stop and SessionEnd, or a
   // subagent finishing alongside its parent). Claim the turn before posting: the

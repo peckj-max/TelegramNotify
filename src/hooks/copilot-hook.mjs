@@ -180,7 +180,7 @@ async function handleCompleted(eventName, input) {
     hint: input.transcriptPath || input.transcript_path || input.transcriptFile || '',
     sessionId,
   });
-  const found = await readLastAssistantMessage(transcript);
+  const found = await readLastAssistantMessage(transcript, { agent: AGENT });
   // What a hook payload carries itself beats the transcript: a host that sends the
   // answer in the payload does not need it read from a file.
   const payloadText = String(input.message || input.result || '').trim();
@@ -224,7 +224,7 @@ async function handleCompleted(eventName, input) {
     type: 'completed',
     // The bridge names the agent in the heading (`titleForAgent`), so the hook sends
     // the event, not a product name — the local harness reuses this adapter.
-    title: eventName === 'notification' ? 'needs attention' : summaryOnly ? 'task completed' : 'finished',
+    title: eventName === 'notification' ? 'needs attention' : summaryOnly ? 'done' : 'finished',
     // The summary stands alone in this message, so its meta lead-in ("Answered the
     // factual question:") would only be noise: the heading already says what it is.
     message: summaryOnly ? withoutLeadIn(reported) : full || reported || undefined,

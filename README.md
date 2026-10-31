@@ -35,34 +35,38 @@ flowchart LR
   shows the result, not just "done". The reader walks back through the transcript
   until it finds text, because a final turn's tool output can push the message
   hundreds of KB from the end.
-- **The answer only.** A turn is a loop of narration and tool calls, so the text
-  before the answer ("let me check the query") is progress reporting. Only the
-  closing block of messages that do not come with a tool call is sent; the block
-  is kept whole, so a long answer is not cut down to its final "Done." line. When
-  the agent host ends the turn with its `task_complete` tool, that tool's summary
-  is added after the answer under **Task completed:** — immediately when the same
-  turn reports it, or as its own message when the host continues the turn and reports
-  it later. Hosts also log their own system prompt, hook payloads and session
-  bookkeeping in the transcript, and those entries are never part of the answer;
-  a turn that was interrupted before it answered sends no text rather than its
-  last progress line.
+- **The answer, whole.** A turn is a loop of narration and tool calls, so the text
+  before the answer ("let me check the query") is progress reporting. The last
+  section is sent whole: every visible message from the answer onwards, with the
+  collapsed thinking and tool rows passed over, so a long answer is not cut down to
+  its final "Done." line. Hosts also log their own system prompt, hook payloads and
+  session bookkeeping in the transcript, and those entries are never part of the
+  answer; a turn that was interrupted before it answered sends no text rather than
+  its last progress line.
+- **`Copilot done:`, `Local agent done:`.** When the agent reports its result with
+  `task_complete`, that summary is added after the answer under a **done** label
+  naming the harness — `**Copilot done:**` for the Copilot agent host, `**Local agent
+  done:**` for VS Code's local harness, and the same pattern for Claude Code and
+  OpenCode. The label replaces the old `Task completed:` heading, and the only edit is
+  the summary's own lead-in ("Answered the factual question:"), which would otherwise
+  repeat the label. Both harnesses now form the same message: the Copilot agent host
+  puts the answer in the `task_complete` summary, while the local harness writes the
+  answer in the message that carries the call (with the arguments as a JSON string)
+  and then one short closing note — that note is the `done` note when the call has no
+  summary of its own, and never a second copy of the answer.
 - **Reported once.** Every agent announces the same ending more than once —
   Copilot fires `agentStop` then `sessionEnd`, OpenCode `session.idle` then
   `session.execution.succeeded`, Claude Code `Stop` plus `SubagentStop`/
   `TaskCompleted`. The hook remembers what it already sent for a session (the answer
   and the `task_complete` summary, by fingerprint), so a repeated stop adds nothing.
-- **Sent at once, no waiting window.** A finished turn is posted the moment the hook
-  sees it. The Copilot agent host sometimes stops a turn *before* the agent reports its
-  result, nudges it to continue ("you have not yet marked the task as complete"), and
-  the agent finishes seconds later — the answer is already in the chat, and the
-  `task_complete` summary then arrives as **its own message**, headed *Task completed*.
-  Nothing is held, dropped, or replaced. The host's nudge is not counted as a new
-  turn, so the answer a reader saw is never cut off by it.
-- **The answer, then the panel's `Task completed:` note.** Everything outside the
-  collapsed thinking and tool rows is the answer, and it leads. When the same turn
-  reports through `task_complete` before anyone has read it, its summary follows under
-  the **Task completed:** label the panel uses. The only edit is the summary's own
-  lead-in ("Answered the factual question:"), which would otherwise repeat the label.
+- **Sent at once, `task_complete` is optional.** A finished turn is posted the moment
+  the hook sees it; nothing waits for a `task_complete` call, and a turn that never
+  makes one is still complete. The Copilot agent host sometimes stops a turn *before*
+  the agent reports its result, nudges it to continue ("you have not yet marked the task
+  as complete"), and the agent finishes seconds later — the answer is already in the
+  chat, and the `task_complete` summary then arrives as **its own message**, headed
+  *Copilot done*. Nothing is held, dropped, or replaced. The host's nudge is not
+  counted as a new turn, so the answer a reader saw is never cut off by it.
 - **Two delivery modes.** Webhook mode registers a URL with Telegram and checks
   `X-Telegram-Bot-Api-Secret-Token` on every call; polling mode needs no public
   host at all. Either way only the configured chat ids are allowed to answer.
@@ -800,7 +804,7 @@ is announced in the chat, and the OpenCode panel is where it is granted.
 | `PreToolUse` (`AskUserQuestion`) | Telegram asks first for `claudeAskWindowSeconds`. A Telegram answer returns as a `permissionDecision: "deny"` reason (free text too; several questions as `a | b`); no answer leaves the question to the interface that shows it. |
 | `Notification` | Reports the prompt Claude Code already shows. A permission notification ("Claude needs your permission to use …") is posted as a permission report with no buttons, so it is answered in the panel or terminal; anything else is posted as an attention message. |
 | `UserPromptSubmit` | Tells the bridge that Claude is the agent in use, so the next Telegram prompt goes to Claude, and records the prompt as a running prompt until `Stop`. Silent unless `notifyOnStart` is on. |
-| `Stop`, `SubagentStop`, `TaskCompleted` | Completion notification, sent at once. The answer is everything outside the collapsed rows; a `task_complete` summary that arrives later is sent as its own message, headed *Task completed*. |
+| `Stop`, `SubagentStop`, `TaskCompleted` | Completion notification, sent at once. The answer is the whole last section outside the collapsed rows; a `task_complete` summary that arrives with it follows under `**Copilot done:**` (`**Claude Code done:**` for Claude), and one that arrives later is sent as its own message, headed *Copilot done*. |
 
 No `PermissionRequest` hook is installed. It ran before Claude Code decided
 whether to ask, so it also caught calls that would have been approved by the
